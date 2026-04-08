@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  BrainIcon,
   MessageSquareIcon,
   PanelLeftIcon,
   PenSquareIcon,
@@ -13,6 +14,7 @@ import {
   deleteAllChatsWithToast,
   SidebarHistory,
 } from "@/components/chat/sidebar-history";
+import { MemoryManagerDialog } from "@/components/chat/memory-manager-dialog";
 import {
   Sidebar,
   SidebarContent,
@@ -42,6 +44,7 @@ export function AppSidebar() {
   const router = useRouter();
   const { setOpenMobile, toggleSidebar } = useSidebar();
   const [showDeleteAllDialog, setShowDeleteAllDialog] = useState(false);
+  const [showMemoryDialog, setShowMemoryDialog] = useState(false);
 
   const handleDeleteAll = async () => {
     setShowDeleteAllDialog(false);
@@ -112,6 +115,16 @@ export function AppSidebar() {
                     <span className="text-[13px]">Delete all</span>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    className="rounded-lg text-sidebar-foreground/60 transition-colors duration-150 hover:bg-sidebar-accent/50 hover:text-sidebar-foreground"
+                    onClick={() => setShowMemoryDialog(true)}
+                    tooltip="Long-term Memory"
+                  >
+                    <BrainIcon className="size-4" />
+                    <span className="text-[13px]">Memory</span>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
               </SidebarMenu>
             </SidebarGroupContent>
           </SidebarGroup>
@@ -140,6 +153,11 @@ export function AppSidebar() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      <MemoryManagerDialog
+        onOpenChange={setShowMemoryDialog}
+        open={showMemoryDialog}
+      />
     </>
   );
 }

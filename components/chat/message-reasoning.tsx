@@ -24,14 +24,28 @@ export function MessageReasoning({
     }
   }, [isLoading]);
 
+  const statusLabel = isLoading
+    ? "思考中..."
+    : hasBeenStreaming
+      ? "思考已停止"
+      : "思考完成";
+
   return (
     <Reasoning
+      className="rounded-lg border border-border/40 bg-card/40 px-3 py-2"
       data-testid="message-reasoning"
-      defaultOpen={hasBeenStreaming}
+      defaultOpen={false}
       isStreaming={isLoading}
     >
-      <ReasoningTrigger />
-      <ReasoningContent>{reasoning}</ReasoningContent>
+      <div className="border-border/40 border-l pl-3">
+        <ReasoningTrigger
+          className="text-[12px] text-muted-foreground/85"
+          getThinkingMessage={() => <span>{statusLabel}</span>}
+        />
+        <ReasoningContent className="mt-2 text-muted-foreground/80">
+          {reasoning}
+        </ReasoningContent>
+      </div>
     </Reasoning>
   );
 }

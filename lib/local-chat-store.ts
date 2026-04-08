@@ -64,6 +64,18 @@ export type LocalModelDownloadRecord = {
   updatedAt: Date;
 };
 
+export type LocalMemoryCategory = "preference" | "fact" | "session-context";
+
+export type LocalMemoryRecord = {
+  id: string;
+  category: LocalMemoryCategory;
+  key: string;
+  value: string;
+  sourceChatId: string | null;
+  confidence: number;
+  updatedAt: Date;
+};
+
 type StoredModelDownloadRecord = {
   id: string;
   modelKey: string;
@@ -76,13 +88,24 @@ type StoredModelDownloadRecord = {
   updatedAt: number;
 };
 
+type StoredMemoryRecord = {
+  id: string;
+  category: LocalMemoryCategory;
+  key: string;
+  value: string;
+  sourceChatId: string | null;
+  confidence: number;
+  updatedAt: number;
+};
+
 const DB_NAME = "chatbot-local";
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 const CHATS_STORE = "chats";
 const MESSAGES_STORE = "messages";
 const SETTINGS_STORE = "settings";
 const MODEL_META_STORE = "model_cache_meta";
 const MODEL_DOWNLOAD_STORE = "model_download_state";
+const MEMORY_STORE = "long_term_memory";
 const EVENT_NAME = "local-chat-updated";
 
 function emitChatUpdated() {
@@ -166,6 +189,14 @@ function openDatabase(): Promise<IDBDatabase> {
         modelDownloads.createIndex("updatedAt", "updatedAt", {
           unique: false,
         });
+      }
+
+      if (!db.objectStoreNames.contains(MEMORY_STORE)) {
+        const memories = db.createObjectStore(MEMORY_STORE, {
+          keyPath: "id",
+        });
+        memories.createIndex("category", "category", { unique: false });
+        memories.createIndex("updatedAt", "updatedAt", { unique: false });
       }
     };
 
@@ -362,6 +393,104 @@ export async function getLocalSetting(key: string): Promise<string | null> {
   await txDone(tx);
 
   return record?.value ?? null;
+}
+
+function toLocalMemoryRecord(row: StoredMemoryRecord): LocalMemoryRecord {
+  return {
+    ...row,
+    updatedAt: new Date(row.updatedAt),
+  };
+}
+
+export async function upsertLocalMemory(params: {
+  category: LocalMemoryCategory;
+  key: string;
+  value: string;
+  sourceChatId?: string | null;
+  confidence?: number;
+  updatedAt?: number;
+}): Promise<void> {
+  const db = await openDatabase();
+  const tx = db.transaction(MEMORY_STORE, "readwrite");
+  const store = tx.objectStore(MEMORY_STORE);
+
+  const normalizedKey = params.key.trim().toLowerCase();
+  if (normalizedKey.length === 0) {
+    await txDone(tx);
+    return;
+  }
+
+  const row: StoredMemoryRecord = {
+    id: `${params.category}:${normalizedKey}`,
+    category: params.category,
+    key: normalizedKey,
+    value: params.value.trim(),
+    sourceChatId: params.sourceChatId ?? null,
+    confidence:
+      typeof params.confidence === "number"
+        ? Math.max(0, Math.min(1, params.confidence))
+        : 0.8,
+    updatedAt: params.updatedAt ?? Date.now(),
+  };
+
+  if (!row.value) {
+    await txDone(tx);
+    return;
+  }
+
+  store.put(row);
+  await txDone(tx);
+}
+
+export async function listLocalMemories(
+  category?: LocalMemoryCategory
+): Promise<LocalMemoryRecord[]> {
+  const db = await openDatabase();
+  const tx = db.transaction(MEMORY_STORE, "readonly");
+  const store = tx.objectStore(MEMORY_STORE);
+
+  const rows = category
+    ? ((await requestToPromise(
+        store.index("category").getAll(IDBKeyRange.only(category))
+      )) as StoredMemoryRecord[])
+    : ((await requestToPromise(store.getAll())) as StoredMemoryRecord[]);
+
+  await txDone(tx);
+
+  return rows
+    .map(toLocalMemoryRecord)
+    .sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
+}
+
+export async function deleteLocalMemory(memoryId: string): Promise<void> {
+  const db = await openDatabase();
+  const tx = db.transaction(MEMORY_STORE, "readwrite");
+  tx.objectStore(MEMORY_STORE).delete(memoryId);
+  await txDone(tx);
+}
+
+export async function clearLocalMemories(
+  category?: LocalMemoryCategory
+): Promise<void> {
+  const db = await openDatabase();
+  const tx = db.transaction(MEMORY_STORE, "readwrite");
+  const store = tx.objectStore(MEMORY_STORE);
+
+  if (!category) {
+    store.clear();
+    await txDone(tx);
+    return;
+  }
+
+  const keys = (await requestToPromise(
+    store.index("category").getAllKeys(IDBKeyRange.only(category))
+  )) as IDBValidKey[];
+
+  for (const key of keys) {
+    store.delete(key);
+  }
+
+  await txDone(tx);
 }
 
 function toLocalModelCacheMeta(

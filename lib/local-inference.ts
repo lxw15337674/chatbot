@@ -14,6 +14,8 @@ type LocalLoadMeta = {
   fromCacheCount: number;
 };
 
+export type LocalReasoningMode = "normal" | "thinking";
+
 export type LocalModelLoadPhase =
   | "downloading"
   | "initializing"
@@ -443,18 +445,44 @@ function hasChineseText(text: string) {
   return /[\u4e00-\u9fff]/.test(text);
 }
 
-function shouldDisableThinking(modelId: string) {
+function supportsThinkingToggle(modelId: string) {
   return /onnx-community\/Qwen3(?:\.5)?-/i.test(modelId);
+}
+
+function stripThinkTags(text: string): string {
+  return text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+}
+
+function extractReasoningAndAnswer(text: string): {
+  reasoningText: string;
+  answerText: string;
+} {
+  const reasoningParts: string[] = [];
+  const answerText = text
+    .replace(/<think>([\s\S]*?)<\/think>/gi, (_, block: string) => {
+      const normalized = block.trim();
+      if (normalized.length > 0) {
+        reasoningParts.push(normalized);
+      }
+      return "";
+    })
+    .trim();
+
+  return {
+    reasoningText: reasoningParts.join("\n\n"),
+    answerText,
+  };
 }
 
 function createGenerationOptions(params: {
   modelId: string;
+  reasoningMode: LocalReasoningMode;
   signal?: AbortSignal;
   deterministic?: boolean;
 }) {
-  const { modelId, signal, deterministic = false } = params;
-  const tokenizerEncodeKwargs = shouldDisableThinking(modelId)
-    ? { enable_thinking: false }
+  const { modelId, reasoningMode, signal, deterministic = false } = params;
+  const tokenizerEncodeKwargs = supportsThinkingToggle(modelId)
+    ? { enable_thinking: reasoningMode === "thinking" }
     : undefined;
 
   if (deterministic) {
@@ -546,17 +574,25 @@ function extractLoadMeta(generator: any): LocalLoadMeta {
 export async function generateLocalAssistantResponse(params: {
   modelId: string;
   messages: ChatMessage[];
+  reasoningMode?: LocalReasoningMode;
   signal?: AbortSignal;
   onLoadProgress?: (event: LocalModelLoadProgressEvent) => void;
   isLoadCancelled?: () => boolean;
 }): Promise<{
   text: string;
+  reasoningText: string;
   dtype: LocalDtype;
   device: "webgpu" | "wasm";
   loadMeta: LocalLoadMeta;
 }> {
-  const { modelId, messages, signal, onLoadProgress, isLoadCancelled } =
-    params;
+  const {
+    modelId,
+    messages,
+    reasoningMode = "normal",
+    signal,
+    onLoadProgress,
+    isLoadCancelled,
+  } = params;
   const runtime = await getRuntime(modelId, {
     onLoadProgress,
     isLoadCancelled,
@@ -575,7 +611,11 @@ export async function generateLocalAssistantResponse(params: {
     }))
     .filter((message) => message.content.length > 0);
 
-  const generationOptions = createGenerationOptions({ modelId, signal });
+  const generationOptions = createGenerationOptions({
+    modelId,
+    reasoningMode,
+    signal,
+  });
 
   let output: unknown;
   let plainPromptUsed: string | null = null;
@@ -598,25 +638,46 @@ export async function generateLocalAssistantResponse(params: {
     throw new Error("Generation aborted");
   }
 
-  let text = cleanGeneratedAssistantText(
+  let rawText = cleanGeneratedAssistantText(
     normalizeGeneratedText(output),
     plainPromptUsed
   );
+
+  let parsedReasoning = extractReasoningAndAnswer(rawText);
+  let reasoningText =
+    reasoningMode === "thinking" ? parsedReasoning.reasoningText : "";
+  let text =
+    parsedReasoning.answerText ||
+    (reasoningMode === "normal" ? stripThinkTags(rawText) : rawText);
 
   if (looksLikeGarbledText(text)) {
     try {
       const retryOutput = await runtime.generator(
         generationInput,
-        createGenerationOptions({ modelId, signal, deterministic: true })
+        createGenerationOptions({
+          modelId,
+          reasoningMode,
+          signal,
+          deterministic: true,
+        })
       );
 
-      const retriedText = cleanGeneratedAssistantText(
+      const retriedRawText = cleanGeneratedAssistantText(
         normalizeGeneratedText(retryOutput),
         plainPromptUsed
       );
+      const retriedParsed = extractReasoningAndAnswer(retriedRawText);
+      const retriedAnswer =
+        retriedParsed.answerText ||
+        (reasoningMode === "normal"
+          ? stripThinkTags(retriedRawText)
+          : retriedRawText);
 
-      if (!looksLikeGarbledText(retriedText) && retriedText.length > 0) {
-        text = retriedText;
+      if (!looksLikeGarbledText(retriedAnswer) && retriedAnswer.length > 0) {
+        text = retriedAnswer;
+        if (reasoningMode === "thinking") {
+          reasoningText = retriedParsed.reasoningText;
+        }
       }
     } catch {
       // Keep original text and fall through to model suggestion handling.
@@ -640,6 +701,7 @@ export async function generateLocalAssistantResponse(params: {
 
   return {
     text: text || "我目前还在本地模型冷启动中，请再试一次。",
+    reasoningText,
     dtype: runtime.dtype,
     device: runtime.device,
     loadMeta: runtime.loadMeta,

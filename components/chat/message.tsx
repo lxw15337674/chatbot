@@ -104,7 +104,7 @@ const PurePreviewMessage = ({
         mergedReasoning.rendered = true;
         return (
           <MessageReasoning
-            isLoading={isLoading || mergedReasoning.isStreaming}
+            isLoading={mergedReasoning.isStreaming}
             key={key}
             reasoning={mergedReasoning.text}
           />

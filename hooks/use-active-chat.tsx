@@ -25,14 +25,18 @@ import {
   prepareLocalModel,
   type LocalModelLoadPhase,
   type LocalModelLoadProgressEvent,
+  type LocalReasoningMode,
 } from "@/lib/local-inference";
 import {
+  type LocalMemoryCategory,
   getLocalChatById,
+  listLocalMemories,
   getLocalMessages,
   getLocalSetting,
   replaceLocalMessages,
   saveLocalChat,
   saveLocalSetting,
+  upsertLocalMemory,
 } from "@/lib/local-chat-store";
 import type { ChatMessage } from "@/lib/types";
 import { generateUUID } from "@/lib/utils";
@@ -49,6 +53,8 @@ export type ModelLoadProgressState = {
   updatedAt: number;
   canCancel: boolean;
 };
+
+export type ReasoningMode = LocalReasoningMode;
 
 type ActiveChatContextValue = {
   chatId: string;
@@ -67,6 +73,8 @@ type ActiveChatContextValue = {
   votes: Vote[] | undefined;
   currentModelId: string;
   setCurrentModelId: (id: string) => void;
+  reasoningMode: ReasoningMode;
+  setReasoningMode: (mode: ReasoningMode) => void;
   modelLoadProgress: ModelLoadProgressState | null;
   cancelModelLoad: () => void;
   showCreditCardAlert: boolean;
@@ -109,6 +117,160 @@ function resolveModelId(candidate: string | null | undefined): string {
   }
 
   return DEFAULT_CHAT_MODEL;
+}
+
+function resolveReasoningMode(
+  candidate: string | null | undefined
+): ReasoningMode {
+  return candidate === "thinking" ? "thinking" : "normal";
+}
+
+function getMessageText(message: ChatMessage): string {
+  return message.parts
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .join("\n")
+    .trim();
+}
+
+async function buildMemorySystemMessage(
+  chatId: string
+): Promise<ChatMessage | null> {
+  const [preferences, facts, sessionContexts] = await Promise.all([
+    listLocalMemories("preference"),
+    listLocalMemories("fact"),
+    listLocalMemories("session-context"),
+  ]);
+
+  const sections: string[] = [];
+
+  if (preferences.length > 0) {
+    sections.push(
+      `用户偏好：${preferences
+        .slice(0, 5)
+        .map((item) => `${item.key}=${item.value}`)
+        .join("；")}`
+    );
+  }
+
+  if (facts.length > 0) {
+    sections.push(
+      `已知事实：${facts
+        .slice(0, 5)
+        .map((item) => `${item.key}=${item.value}`)
+        .join("；")}`
+    );
+  }
+
+  const relatedContext = sessionContexts.filter(
+    (item) => item.sourceChatId === chatId
+  );
+  const contextPool = relatedContext.length > 0 ? relatedContext : sessionContexts;
+
+  if (contextPool.length > 0) {
+    sections.push(
+      `上下文：${contextPool
+        .slice(0, 3)
+        .map((item) => item.value)
+        .join("；")}`
+    );
+  }
+
+  if (sections.length === 0) {
+    return null;
+  }
+
+  return {
+    id: `memory-system-${chatId}`,
+    role: "system",
+    parts: [
+      {
+        type: "text",
+        text: `请结合以下长期记忆回答，若与当前用户输入冲突，以当前输入为准。\n${sections.join("\n")}`,
+      },
+    ],
+    metadata: {
+      createdAt: new Date().toISOString(),
+    },
+  };
+}
+
+function extractMemoryCandidates(text: string): Array<{
+  category: LocalMemoryCategory;
+  key: string;
+  value: string;
+  confidence: number;
+}> {
+  const candidates: Array<{
+    category: LocalMemoryCategory;
+    key: string;
+    value: string;
+    confidence: number;
+  }> = [];
+
+  const normalized = text.trim();
+  if (!normalized) {
+    return candidates;
+  }
+
+  const nameMatch = normalized.match(/我叫\s*([^，。,.!?\s]{2,20})/);
+  if (nameMatch?.[1]) {
+    candidates.push({
+      category: "fact",
+      key: "user-name",
+      value: nameMatch[1],
+      confidence: 0.95,
+    });
+  }
+
+  const roleMatch = normalized.match(/我是\s*([^，。,.!?]{2,24})/);
+  if (roleMatch?.[1]) {
+    candidates.push({
+      category: "fact",
+      key: "user-role",
+      value: roleMatch[1].trim(),
+      confidence: 0.85,
+    });
+  }
+
+  const languageMatch = normalized.match(/请用\s*(中文|英文|英语)\s*([回答回复输出]?)/);
+  if (languageMatch?.[1]) {
+    candidates.push({
+      category: "preference",
+      key: "response-language",
+      value: languageMatch[1].includes("英") ? "en" : "zh",
+      confidence: 0.95,
+    });
+  }
+
+  if (/简短|简洁|一句话/.test(normalized)) {
+    candidates.push({
+      category: "preference",
+      key: "response-style",
+      value: "concise",
+      confidence: 0.8,
+    });
+  }
+
+  if (/详细|展开|尽可能完整/.test(normalized)) {
+    candidates.push({
+      category: "preference",
+      key: "response-style",
+      value: "detailed",
+      confidence: 0.8,
+    });
+  }
+
+  if (/这轮|当前任务|这个项目|我们项目|先做/.test(normalized)) {
+    candidates.push({
+      category: "session-context",
+      key: "active-context",
+      value: normalized.slice(0, 240),
+      confidence: 0.75,
+    });
+  }
+
+  return candidates;
 }
 
 function splitTextForStreaming(text: string): string[] {
@@ -157,6 +319,7 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
   const chatId = chatIdFromUrl ?? newChatIdRef.current;
 
   const [currentModelId, setCurrentModelId] = useState(DEFAULT_CHAT_MODEL);
+  const [reasoningMode, setReasoningMode] = useState<ReasoningMode>("normal");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [status, setStatus] = useState<UseChatHelpers<ChatMessage>["status"]>(
     "ready"
@@ -168,6 +331,7 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
     useState<VisibilityType>("private");
 
   const currentModelIdRef = useRef(currentModelId);
+  const reasoningModeRef = useRef(reasoningMode);
   const messagesRef = useRef<ChatMessage[]>(messages);
   const abortControllerRef = useRef<AbortController | null>(null);
   const runtimeNoticeRef = useRef<string>("");
@@ -182,6 +346,10 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     currentModelIdRef.current = currentModelId;
   }, [currentModelId]);
+
+  useEffect(() => {
+    reasoningModeRef.current = reasoningMode;
+  }, [reasoningMode]);
 
   useEffect(() => {
     messagesRef.current = messages;
@@ -201,10 +369,11 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
       setIsLoading(true);
 
       try {
-        const [chat, rows, savedModel] = await Promise.all([
+        const [chat, rows, savedModel, savedReasoningMode] = await Promise.all([
           getLocalChatById(chatId),
           getLocalMessages<ChatMessage>(chatId),
           getLocalSetting("local-chat-model"),
+          getLocalSetting("local-reasoning-mode"),
         ]);
 
         if (!isMounted) {
@@ -215,11 +384,13 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
         setVisibilityType(chat?.visibility ?? "private");
 
         setCurrentModelId(resolveModelId(chat?.modelId ?? savedModel));
+        setReasoningMode(resolveReasoningMode(savedReasoningMode));
       } catch {
         if (isMounted) {
           setMessages([]);
           setVisibilityType("private");
           setCurrentModelId(DEFAULT_CHAT_MODEL);
+          setReasoningMode("normal");
         }
       } finally {
         if (isMounted) {
@@ -238,6 +409,10 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     void saveLocalSetting("local-chat-model", currentModelId);
   }, [currentModelId]);
+
+  useEffect(() => {
+    void saveLocalSetting("local-reasoning-mode", reasoningMode);
+  }, [reasoningMode]);
 
   const persistConversation = async (nextMessages: ChatMessage[]) => {
     if (nextMessages.length === 0) {
@@ -518,9 +693,15 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
     }
 
     try {
+      const memorySystemMessage = await buildMemorySystemMessage(chatId);
+      const inferenceMessages = memorySystemMessage
+        ? [memorySystemMessage, ...baseMessages]
+        : baseMessages;
+
       const result = await generateLocalAssistantResponse({
         modelId,
-        messages: baseMessages,
+        messages: inferenceMessages,
+        reasoningMode: reasoningModeRef.current,
         signal: controller.signal,
         onLoadProgress: loadSessionId
           ? (event) => applyModelLoadProgress(loadSessionId as string, event)
@@ -556,6 +737,17 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
       const assistantId = generateUUID();
       const createdAt = new Date().toISOString();
       const chunks = splitTextForStreaming(result.text);
+      const reasoningPart =
+        reasoningModeRef.current === "thinking" &&
+        result.reasoningText.trim().length > 0
+          ? ([
+              {
+                type: "reasoning",
+                text: result.reasoningText,
+                state: "done",
+              },
+            ] as any[])
+          : [];
 
       setStatus("streaming");
       setMessages([
@@ -563,7 +755,7 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
         {
           id: assistantId,
           role: "assistant",
-          parts: [{ type: "text", text: "" }],
+          parts: [...reasoningPart, { type: "text", text: "" }] as any,
           metadata: {
             createdAt,
           },
@@ -585,7 +777,7 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
           {
             id: assistantId,
             role: "assistant",
-            parts: [{ type: "text", text: streamedText }],
+            parts: [...reasoningPart, { type: "text", text: streamedText }] as any,
             metadata: {
               createdAt,
             },
@@ -598,7 +790,7 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
       const assistantMessage: ChatMessage = {
         id: assistantId,
         role: "assistant",
-        parts: [{ type: "text", text: result.text }],
+        parts: [...reasoningPart, { type: "text", text: result.text }] as any,
         metadata: {
           createdAt,
         },
@@ -676,6 +868,23 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
     setDataStream([]);
 
     await persistConversation(nextMessages);
+
+    if (nextUserMessage.role === "user") {
+      const candidates = extractMemoryCandidates(getMessageText(nextUserMessage));
+      if (candidates.length > 0) {
+        await Promise.all(
+          candidates.map((candidate) =>
+            upsertLocalMemory({
+              category: candidate.category,
+              key: candidate.key,
+              value: candidate.value,
+              confidence: candidate.confidence,
+              sourceChatId: chatId,
+            })
+          )
+        );
+      }
+    }
 
     if (nextUserMessage.role === "user") {
       await runAssistantGeneration(nextMessages);
@@ -769,6 +978,8 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
       votes,
       currentModelId,
       setCurrentModelId: handleModelChange,
+      reasoningMode,
+      setReasoningMode,
       modelLoadProgress,
       cancelModelLoad,
       showCreditCardAlert,
@@ -790,6 +1001,7 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
       votes,
       currentModelId,
       handleModelChange,
+      reasoningMode,
       modelLoadProgress,
       cancelModelLoad,
       showCreditCardAlert,

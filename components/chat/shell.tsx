@@ -37,6 +37,8 @@ export function ChatShell() {
     votes,
     currentModelId,
     setCurrentModelId,
+    reasoningMode,
+    setReasoningMode,
     modelLoadProgress,
     cancelModelLoad,
     showCreditCardAlert,
@@ -110,6 +112,8 @@ export function ChatShell() {
                   }}
                   onCancelModelLoad={cancelModelLoad}
                   onModelChange={setCurrentModelId}
+                  onReasoningModeChange={setReasoningMode}
+                  selectedReasoningMode={reasoningMode}
                   selectedModelId={currentModelId}
                   selectedVisibilityType={visibilityType}
                   sendMessage={

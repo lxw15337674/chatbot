@@ -41,7 +41,10 @@ import {
   DEFAULT_CHAT_MODEL,
   localModelCapabilities,
 } from "@/lib/ai/models";
-import type { ModelLoadProgressState } from "@/hooks/use-active-chat";
+import type {
+  ModelLoadProgressState,
+  ReasoningMode,
+} from "@/hooks/use-active-chat";
 import {
   clearLocalChats,
   deleteLocalChat,
@@ -102,7 +105,9 @@ function PureMultimodalInput({
   className,
   selectedVisibilityType,
   selectedModelId,
+  selectedReasoningMode,
   onModelChange,
+  onReasoningModeChange,
   modelLoadProgress,
   onCancelModelLoad,
   editingMessage,
@@ -124,7 +129,9 @@ function PureMultimodalInput({
   className?: string;
   selectedVisibilityType: VisibilityType;
   selectedModelId: string;
+  selectedReasoningMode: ReasoningMode;
   onModelChange?: (modelId: string) => void;
+  onReasoningModeChange?: (mode: ReasoningMode) => void;
   modelLoadProgress?: ModelLoadProgressState | null;
   onCancelModelLoad?: () => void;
   editingMessage?: ChatMessage | null;
@@ -628,6 +635,10 @@ function PureMultimodalInput({
               onModelChange={onModelChange}
               selectedModelId={selectedModelId}
             />
+            <ReasoningModeToggle
+              onReasoningModeChange={onReasoningModeChange}
+              selectedReasoningMode={selectedReasoningMode}
+            />
           </PromptInputTools>
 
           {status === "submitted" ? (
@@ -670,6 +681,9 @@ export const MultimodalInput = memo(
       return false;
     }
     if (prevProps.selectedModelId !== nextProps.selectedModelId) {
+      return false;
+    }
+    if (prevProps.selectedReasoningMode !== nextProps.selectedReasoningMode) {
       return false;
     }
     if (!equal(prevProps.modelLoadProgress, nextProps.modelLoadProgress)) {
@@ -722,6 +736,51 @@ function PureAttachmentsButton({
 }
 
 const AttachmentsButton = memo(PureAttachmentsButton);
+
+function PureReasoningModeToggle({
+  selectedReasoningMode,
+  onReasoningModeChange,
+}: {
+  selectedReasoningMode: ReasoningMode;
+  onReasoningModeChange?: (mode: ReasoningMode) => void;
+}) {
+  return (
+    <div className="flex items-center gap-1 rounded-lg border border-border/40 p-0.5">
+      <button
+        className={cn(
+          "rounded-md px-2 py-1 text-[11px] transition-colors",
+          selectedReasoningMode === "normal"
+            ? "bg-muted text-foreground"
+            : "text-muted-foreground hover:text-foreground"
+        )}
+        onMouseDown={(event) => {
+          event.preventDefault();
+          onReasoningModeChange?.("normal");
+        }}
+        type="button"
+      >
+        普通
+      </button>
+      <button
+        className={cn(
+          "rounded-md px-2 py-1 text-[11px] transition-colors",
+          selectedReasoningMode === "thinking"
+            ? "bg-muted text-foreground"
+            : "text-muted-foreground hover:text-foreground"
+        )}
+        onMouseDown={(event) => {
+          event.preventDefault();
+          onReasoningModeChange?.("thinking");
+        }}
+        type="button"
+      >
+        思考
+      </button>
+    </div>
+  );
+}
+
+const ReasoningModeToggle = memo(PureReasoningModeToggle);
 
 function PureModelSelectorCompact({
   selectedModelId,
