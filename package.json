@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev --turbo",
-    "build": "tsx lib/db/migrate && next build",
+    "build": "next build",
     "start": "next start",
     "check": "ultracite check",
     "fix": "ultracite fix",
@@ -80,6 +80,7 @@
     "swr": "^2.2.5",
     "tailwind-merge": "^2.5.2",
     "tailwindcss-animate": "^1.0.7",
+    "@huggingface/transformers": "^4.0.1",
     "use-stick-to-bottom": "^1.1.1",
     "usehooks-ts": "^3.1.0",
     "zod": "^3.25.76"

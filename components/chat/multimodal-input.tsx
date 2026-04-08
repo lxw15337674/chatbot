@@ -23,7 +23,6 @@ import {
   useState,
 } from "react";
 import { toast } from "sonner";
-import useSWR from "swr";
 import { useLocalStorage, useWindowSize } from "usehooks-ts";
 import {
   ModelSelector,
@@ -40,8 +39,14 @@ import {
   type ChatModel,
   chatModels,
   DEFAULT_CHAT_MODEL,
-  type ModelCapabilities,
+  localModelCapabilities,
 } from "@/lib/ai/models";
+import type { ModelLoadProgressState } from "@/hooks/use-active-chat";
+import {
+  clearLocalChats,
+  deleteLocalChat,
+  listLocalModelCacheMeta,
+} from "@/lib/local-chat-store";
 import type { Attachment, ChatMessage } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import {
@@ -68,6 +73,21 @@ function setCookie(name: string, value: string) {
   document.cookie = `${name}=${encodeURIComponent(value)}; path=/; max-age=${maxAge}`;
 }
 
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0 B";
+  }
+
+  const units = ["B", "KB", "MB", "GB"];
+  const exponent = Math.min(
+    Math.floor(Math.log(bytes) / Math.log(1024)),
+    units.length - 1
+  );
+  const value = bytes / 1024 ** exponent;
+
+  return `${value.toFixed(exponent === 0 ? 0 : 1)} ${units[exponent]}`;
+}
+
 function PureMultimodalInput({
   chatId,
   input,
@@ -83,6 +103,8 @@ function PureMultimodalInput({
   selectedVisibilityType,
   selectedModelId,
   onModelChange,
+  modelLoadProgress,
+  onCancelModelLoad,
   editingMessage,
   onCancelEdit,
   isLoading,
@@ -103,6 +125,8 @@ function PureMultimodalInput({
   selectedVisibilityType: VisibilityType;
   selectedModelId: string;
   onModelChange?: (modelId: string) => void;
+  modelLoadProgress?: ModelLoadProgressState | null;
+  onCancelModelLoad?: () => void;
   editingMessage?: ChatMessage | null;
   onCancelEdit?: () => void;
   isLoading?: boolean;
@@ -179,11 +203,8 @@ function PureMultimodalInput({
         toast("Delete this chat?", {
           action: {
             label: "Delete",
-            onClick: () => {
-              fetch(
-                `${process.env.NEXT_PUBLIC_BASE_PATH ?? ""}/api/chat?id=${chatId}`,
-                { method: "DELETE" }
-              );
+            onClick: async () => {
+              await deleteLocalChat(chatId);
               router.push("/");
               toast.success("Chat deleted");
             },
@@ -194,10 +215,8 @@ function PureMultimodalInput({
         toast("Delete all chats?", {
           action: {
             label: "Delete all",
-            onClick: () => {
-              fetch(`${process.env.NEXT_PUBLIC_BASE_PATH ?? ""}/api/history`, {
-                method: "DELETE",
-              });
+            onClick: async () => {
+              await clearLocalChats();
               router.push("/");
               toast.success("All chats deleted");
             },
@@ -257,30 +276,12 @@ function PureMultimodalInput({
   ]);
 
   const uploadFile = useCallback(async (file: File) => {
-    const formData = new FormData();
-    formData.append("file", file);
-
     try {
-      const response = await fetch(
-        `${process.env.NEXT_PUBLIC_BASE_PATH ?? ""}/api/files/upload`,
-        {
-          method: "POST",
-          body: formData,
-        }
-      );
-
-      if (response.ok) {
-        const data = await response.json();
-        const { url, pathname, contentType } = data;
-
-        return {
-          url,
-          name: pathname,
-          contentType,
-        };
-      }
-      const { error } = await response.json();
-      toast.error(error);
+      return {
+        url: URL.createObjectURL(file),
+        name: file.name,
+        contentType: file.type,
+      };
     } catch (_error) {
       toast.error("Failed to upload file, please try again!");
     }
@@ -368,8 +369,108 @@ function PureMultimodalInput({
     return () => textarea.removeEventListener("paste", handlePaste);
   }, [handlePaste]);
 
+  const loadProgressWidth = (() => {
+    if (!modelLoadProgress) {
+      return 0;
+    }
+
+    if (modelLoadProgress.phase === "downloading") {
+      if (typeof modelLoadProgress.progress === "number") {
+        return Math.max(6, Math.min(98, modelLoadProgress.progress));
+      }
+      if (modelLoadProgress.totalBytes > 0) {
+        const ratio =
+          (modelLoadProgress.loadedBytes / modelLoadProgress.totalBytes) * 100;
+        return Math.max(6, Math.min(98, ratio));
+      }
+      return 40;
+    }
+
+    if (modelLoadProgress.phase === "initializing") {
+      if (typeof modelLoadProgress.progress === "number") {
+        return Math.max(92, Math.min(99, modelLoadProgress.progress));
+      }
+      return modelLoadProgress.totalBytes > 0 ? 96 : 88;
+    }
+
+    if (modelLoadProgress.phase === "ready") {
+      return 100;
+    }
+
+    return 0;
+  })();
+
+  const progressToneClass =
+    modelLoadProgress?.phase === "failed"
+      ? "bg-red-500/80"
+      : modelLoadProgress?.phase === "cancelled"
+        ? "bg-muted-foreground/35"
+        : "bg-foreground";
+
+  const progressSummary = (() => {
+    if (!modelLoadProgress) {
+      return "";
+    }
+
+    const summaryParts: string[] = [];
+
+    if (typeof modelLoadProgress.progress === "number") {
+      summaryParts.push(`${Math.round(modelLoadProgress.progress)}%`);
+    }
+
+    if (modelLoadProgress.totalBytes > 0) {
+      summaryParts.push(
+        `${formatBytes(modelLoadProgress.loadedBytes)} / ${formatBytes(modelLoadProgress.totalBytes)}`
+      );
+    }
+
+    return summaryParts.join(" · ");
+  })();
+
   return (
     <div className={cn("relative flex w-full flex-col gap-4", className)}>
+      {modelLoadProgress && (
+        <div className="rounded-xl border border-border/50 bg-card/80 px-3 py-2.5 shadow-(--shadow-card)">
+          <div className="flex items-center justify-between gap-2">
+            <div className="truncate text-[12px] text-foreground/85">
+              {modelLoadProgress.message}
+            </div>
+
+            <div className="ml-auto flex shrink-0 items-center gap-2 text-[11px] text-muted-foreground">
+              {progressSummary && <span>{progressSummary}</span>}
+
+              {modelLoadProgress.canCancel && onCancelModelLoad && (
+                <button
+                  className="rounded-md px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    onCancelModelLoad();
+                  }}
+                  type="button"
+                >
+                  取消
+                </button>
+              )}
+            </div>
+          </div>
+
+          <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-muted/70">
+            <div
+              className={cn(
+                "h-full rounded-full transition-[width] duration-300 ease-out",
+                progressToneClass,
+                (modelLoadProgress.phase === "downloading" ||
+                  modelLoadProgress.phase === "initializing") &&
+                  "animate-pulse"
+              )}
+              style={{
+                width: `${loadProgressWidth}%`,
+              }}
+            />
+          </div>
+        </div>
+      )}
+
       {editingMessage && onCancelEdit && (
         <div className="flex items-center gap-2 text-[12px] text-muted-foreground">
           <span>Editing message</span>
@@ -419,7 +520,7 @@ function PureMultimodalInput({
       </div>
 
       <PromptInput
-        className="[&>div]:rounded-2xl [&>div]:border [&>div]:border-border/30 [&>div]:bg-card/70 [&>div]:shadow-[var(--shadow-composer)] [&>div]:transition-shadow [&>div]:duration-300 [&>div]:focus-within:shadow-[var(--shadow-composer-focus)]"
+        className="[&>div]:rounded-2xl [&>div]:border [&>div]:border-border/30 [&>div]:bg-card/70 [&>div]:shadow-(--shadow-composer) [&>div]:transition-shadow [&>div]:duration-300 [&>div]:focus-within:shadow-(--shadow-composer-focus)"
         onSubmit={() => {
           if (input.startsWith("/")) {
             const query = input.slice(1).trim();
@@ -523,6 +624,7 @@ function PureMultimodalInput({
               status={status}
             />
             <ModelSelectorCompact
+              modelLoadProgress={modelLoadProgress}
               onModelChange={onModelChange}
               selectedModelId={selectedModelId}
             />
@@ -570,6 +672,9 @@ export const MultimodalInput = memo(
     if (prevProps.selectedModelId !== nextProps.selectedModelId) {
       return false;
     }
+    if (!equal(prevProps.modelLoadProgress, nextProps.modelLoadProgress)) {
+      return false;
+    }
     if (prevProps.editingMessage !== nextProps.editingMessage) {
       return false;
     }
@@ -593,15 +698,7 @@ function PureAttachmentsButton({
   status: UseChatHelpers<ChatMessage>["status"];
   selectedModelId: string;
 }) {
-  const { data: modelsResponse } = useSWR(
-    `${process.env.NEXT_PUBLIC_BASE_PATH ?? ""}/api/models`,
-    (url: string) => fetch(url).then((r) => r.json()),
-    { revalidateOnFocus: false, dedupingInterval: 3_600_000 }
-  );
-
-  const caps: Record<string, ModelCapabilities> | undefined =
-    modelsResponse?.capabilities ?? modelsResponse;
-  const hasVision = caps?.[selectedModelId]?.vision ?? false;
+  const hasVision = localModelCapabilities[selectedModelId]?.vision ?? false;
 
   return (
     <Button
@@ -628,22 +725,46 @@ const AttachmentsButton = memo(PureAttachmentsButton);
 
 function PureModelSelectorCompact({
   selectedModelId,
+  modelLoadProgress,
   onModelChange,
 }: {
   selectedModelId: string;
+  modelLoadProgress?: ModelLoadProgressState | null;
   onModelChange?: (modelId: string) => void;
 }) {
   const [open, setOpen] = useState(false);
-  const { data: modelsData } = useSWR(
-    `${process.env.NEXT_PUBLIC_BASE_PATH ?? ""}/api/models`,
-    (url: string) => fetch(url).then((r) => r.json()),
-    { revalidateOnFocus: false, dedupingInterval: 3_600_000 }
-  );
+  const [cachedSizeMap, setCachedSizeMap] = useState<Record<string, number>>({});
+  const capabilities = localModelCapabilities;
+  const activeModels = chatModels;
 
-  const capabilities: Record<string, ModelCapabilities> | undefined =
-    modelsData?.capabilities ?? modelsData;
-  const dynamicModels: ChatModel[] | undefined = modelsData?.models;
-  const activeModels = dynamicModels ?? chatModels;
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+
+    let mounted = true;
+
+    const loadCacheMeta = async () => {
+      const rows = await listLocalModelCacheMeta();
+      if (!mounted) {
+        return;
+      }
+
+      setCachedSizeMap(
+        Object.fromEntries(
+          rows
+            .filter((row) => row.bytesTotal > 0)
+            .map((row) => [row.modelId, row.bytesTotal])
+        )
+      );
+    };
+
+    void loadCacheMeta();
+
+    return () => {
+      mounted = false;
+    };
+  }, [open, modelLoadProgress?.phase, modelLoadProgress?.modelId]);
 
   const selectedModel =
     activeModels.find((m: ChatModel) => m.id === selectedModelId) ??
@@ -668,21 +789,14 @@ function PureModelSelectorCompact({
         <ModelSelectorList>
           {(() => {
             const curatedIds = new Set(chatModels.map((m) => m.id));
-            const allModels = dynamicModels
-              ? [
-                  ...chatModels,
-                  ...dynamicModels.filter((m) => !curatedIds.has(m.id)),
-                ]
-              : chatModels;
+            const allModels = chatModels;
 
             const grouped: Record<
               string,
               { model: ChatModel; curated: boolean }[]
             > = {};
             for (const model of allModels) {
-              const key = curatedIds.has(model.id)
-                ? "_available"
-                : model.provider;
+              const key = curatedIds.has(model.id) ? "_available" : model.provider;
               if (!grouped[key]) {
                 grouped[key] = [];
               }
@@ -735,6 +849,31 @@ function PureModelSelectorCompact({
               >
                 {grouped[key].map(({ model, curated }) => {
                   const logoProvider = model.id.split("/")[0];
+                  const isModelDownloading =
+                    modelLoadProgress?.modelId === model.id &&
+                    (modelLoadProgress.phase === "downloading" ||
+                      modelLoadProgress.phase === "initializing");
+
+                  const runtimeSizeLabel = isModelDownloading
+                    ? modelLoadProgress.totalBytes > 0
+                      ? `${formatBytes(modelLoadProgress.loadedBytes)} / ${formatBytes(modelLoadProgress.totalBytes)}`
+                      : typeof modelLoadProgress.progress === "number"
+                        ? `${Math.round(modelLoadProgress.progress)}%`
+                        : "加载中..."
+                    : null;
+
+                  const cachedBytes = cachedSizeMap[model.id] ?? 0;
+                  const cachedSizeLabel =
+                    cachedBytes > 0 ? `${formatBytes(cachedBytes)} (已缓存)` : null;
+
+                  const estimatedSizeLabel =
+                    model.estimatedSizeBytes > 0
+                      ? `约 ${formatBytes(model.estimatedSizeBytes)}`
+                      : "大小未知";
+
+                  const modelSizeLabel =
+                    runtimeSizeLabel ?? cachedSizeLabel ?? estimatedSizeLabel;
+
                   return (
                     <ModelSelectorItem
                       className={cn(
@@ -762,7 +901,12 @@ function PureModelSelectorCompact({
                       value={model.id}
                     >
                       <ModelSelectorLogo provider={logoProvider} />
-                      <ModelSelectorName>{model.name}</ModelSelectorName>
+                      <div className="flex min-w-0 flex-1 flex-col">
+                        <ModelSelectorName>{model.name}</ModelSelectorName>
+                        <span className="truncate text-[11px] text-muted-foreground">
+                          {modelSizeLabel}
+                        </span>
+                      </div>
                       <div className="ml-auto flex items-center gap-2 text-foreground/70">
                         {capabilities?.[model.id]?.tools && (
                           <WrenchIcon className="size-3.5" />
