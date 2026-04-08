@@ -17,6 +17,7 @@ import { ChatHeader } from "./chat-header";
 import { DataStreamHandler } from "./data-stream-handler";
 import { submitEditedMessage } from "./message-editor";
 import { Messages } from "./messages";
+import { ModelDownloadDialog } from "./model-download-dialog";
 import { MultimodalInput } from "./multimodal-input";
 
 export function ChatShell() {
@@ -110,11 +111,10 @@ export function ChatShell() {
                     setEditingMessage(null);
                     setInput("");
                   }}
-                  onCancelModelLoad={cancelModelLoad}
                   onModelChange={setCurrentModelId}
                   onReasoningModeChange={setReasoningMode}
-                  selectedReasoningMode={reasoningMode}
                   selectedModelId={currentModelId}
+                  selectedReasoningMode={reasoningMode}
                   selectedVisibilityType={visibilityType}
                   sendMessage={
                     editingMessage
@@ -144,6 +144,11 @@ export function ChatShell() {
       </div>
 
       <DataStreamHandler />
+
+      <ModelDownloadDialog
+        modelLoadProgress={modelLoadProgress}
+        onCancel={cancelModelLoad}
+      />
 
       <AlertDialog
         onOpenChange={setShowCreditCardAlert}

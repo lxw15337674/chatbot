@@ -334,7 +334,6 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
   const reasoningModeRef = useRef(reasoningMode);
   const messagesRef = useRef<ChatMessage[]>(messages);
   const abortControllerRef = useRef<AbortController | null>(null);
-  const runtimeNoticeRef = useRef<string>("");
   const modelLoadProgressRef = useRef<ModelLoadProgressState | null>(null);
   const loadSessionSequenceRef = useRef(0);
   const activeLoadSessionRef = useRef<string | null>(null);
@@ -461,7 +460,8 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
 
           if (
             previous.phase === "ready" ||
-            previous.phase === "cancelled"
+            previous.phase === "cancelled" ||
+            previous.phase === "failed"
           ) {
             if (activeLoadSessionRef.current === sessionId) {
               activeLoadSessionRef.current = null;
@@ -587,8 +587,9 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
           canCancel: false,
         };
       });
+      scheduleModelLoadHide(sessionId, 2800);
     },
-    [isLoadSessionActive]
+    [isLoadSessionActive, scheduleModelLoadHide]
   );
 
   const cancelModelLoad = useCallback(() => {
@@ -664,9 +665,8 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
 
       cancelModelLoad();
       setCurrentModelId(modelId);
-      void prepareModel(modelId);
     },
-    [cancelModelLoad, prepareModel]
+    [cancelModelLoad]
   );
 
   const runAssistantGeneration = async (baseMessages: ChatMessage[]) => {
@@ -713,20 +713,6 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
 
       if (loadSessionId) {
         markModelLoadComplete(loadSessionId);
-      }
-
-      const runtimeNoticeKey = `${currentModelIdRef.current}:${result.device}:${result.dtype}:${result.loadMeta.fromCacheCount}`;
-      if (runtimeNoticeRef.current !== runtimeNoticeKey) {
-        runtimeNoticeRef.current = runtimeNoticeKey;
-        const cacheLabel =
-          result.loadMeta.fileCount > 0
-            ? `${result.loadMeta.fromCacheCount}/${result.loadMeta.fileCount} 命中缓存`
-            : "缓存信息暂不可用";
-
-        toast({
-          type: "success",
-          description: `本地模型已就绪：${result.device.toUpperCase()} · ${result.dtype} · ${cacheLabel}`,
-        });
       }
 
       if (controller.signal.aborted) {

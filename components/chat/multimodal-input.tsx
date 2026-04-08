@@ -35,19 +35,20 @@ import {
   ModelSelectorName,
   ModelSelectorTrigger,
 } from "@/components/ai-elements/model-selector";
+import type {
+  ModelLoadProgressState,
+  ReasoningMode,
+} from "@/hooks/use-active-chat";
 import {
   type ChatModel,
   chatModels,
   DEFAULT_CHAT_MODEL,
   localModelCapabilities,
 } from "@/lib/ai/models";
-import type {
-  ModelLoadProgressState,
-  ReasoningMode,
-} from "@/hooks/use-active-chat";
 import {
   clearLocalChats,
   deleteLocalChat,
+  getLocalModelDownloadSummary,
   listLocalModelCacheMeta,
 } from "@/lib/local-chat-store";
 import type { Attachment, ChatMessage } from "@/lib/types";
@@ -59,6 +60,7 @@ import {
   PromptInputTextarea,
   PromptInputTools,
 } from "../ai-elements/prompt-input";
+import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { PaperclipIcon, StopIcon } from "./icons";
 import { PreviewAttachment } from "./preview-attachment";
@@ -91,6 +93,119 @@ function formatBytes(bytes: number): string {
   return `${value.toFixed(exponent === 0 ? 0 : 1)} ${units[exponent]}`;
 }
 
+type LocalModelAvailabilityState = {
+  bytesTotal: number;
+  downloadComplete: boolean;
+};
+
+type ModelAvailabilityStatus =
+  | "available"
+  | "need-download"
+  | "downloading"
+  | "unavailable";
+
+const availabilityLabelByStatus: Record<ModelAvailabilityStatus, string> = {
+  available: "可用",
+  "need-download": "需下载",
+  downloading: "下载中",
+  unavailable: "不可用",
+};
+
+const availabilityVariantByStatus: Record<
+  ModelAvailabilityStatus,
+  "default" | "secondary" | "destructive" | "outline" | "ghost" | "link"
+> = {
+  available: "secondary",
+  "need-download": "outline",
+  downloading: "default",
+  unavailable: "destructive",
+};
+
+function getInlineModelStatus(params: {
+  selectedModelId: string;
+  modelLoadProgress?: ModelLoadProgressState | null;
+  availability?: LocalModelAvailabilityState;
+}): {
+  label: string;
+  toneClassName: string;
+} {
+  const { selectedModelId, modelLoadProgress, availability } = params;
+  const selectedModel =
+    chatModels.find((model) => model.id === selectedModelId) ??
+    chatModels.find((model) => model.id === DEFAULT_CHAT_MODEL) ??
+    chatModels[0];
+
+  if (modelLoadProgress?.modelId === selectedModelId) {
+    if (modelLoadProgress.phase === "downloading") {
+      return {
+        label: `${selectedModel.name}：模型下载中`,
+        toneClassName: "text-foreground",
+      };
+    }
+
+    if (modelLoadProgress.phase === "initializing") {
+      return {
+        label: `${selectedModel.name}：模型准备中`,
+        toneClassName: "text-muted-foreground",
+      };
+    }
+
+    if (modelLoadProgress.phase === "failed") {
+      return {
+        label: `${selectedModel.name}：模型加载失败`,
+        toneClassName: "text-destructive",
+      };
+    }
+  }
+
+  if (availability?.downloadComplete) {
+    return {
+      label: `${selectedModel.name}：模型已下载`,
+      toneClassName: "text-muted-foreground",
+    };
+  }
+
+  return {
+    label: `${selectedModel.name}：需下载模型`,
+    toneClassName: "text-muted-foreground",
+  };
+}
+
+function resolveModelAvailabilityStatus(params: {
+  modelId: string;
+  modelLoadProgress?: ModelLoadProgressState | null;
+  availability?: LocalModelAvailabilityState;
+}): ModelAvailabilityStatus {
+  const { modelId, modelLoadProgress, availability } = params;
+  const isCurrentLoadModel = modelLoadProgress?.modelId === modelId;
+
+  if (
+    isCurrentLoadModel &&
+    (modelLoadProgress.phase === "downloading" ||
+      modelLoadProgress.phase === "initializing")
+  ) {
+    if (availability?.downloadComplete) {
+      return "available";
+    }
+
+    return "downloading";
+  }
+
+  if (
+    isCurrentLoadModel &&
+    (modelLoadProgress.phase === "failed" ||
+      modelLoadProgress.phase === "cancelled")
+  ) {
+    return "unavailable";
+  }
+
+  if (availability?.downloadComplete) {
+    return "available";
+  }
+
+  return "need-download";
+}
+
 function PureMultimodalInput({
   chatId,
   input,
@@ -109,7 +224,6 @@ function PureMultimodalInput({
   onModelChange,
   onReasoningModeChange,
   modelLoadProgress,
-  onCancelModelLoad,
   editingMessage,
   onCancelEdit,
   isLoading,
@@ -133,7 +247,6 @@ function PureMultimodalInput({
   onModelChange?: (modelId: string) => void;
   onReasoningModeChange?: (mode: ReasoningMode) => void;
   modelLoadProgress?: ModelLoadProgressState | null;
-  onCancelModelLoad?: () => void;
   editingMessage?: ChatMessage | null;
   onCancelEdit?: () => void;
   isLoading?: boolean;
@@ -157,6 +270,8 @@ function PureMultimodalInput({
     "input",
     ""
   );
+  const [selectedModelAvailability, setSelectedModelAvailability] =
+    useState<LocalModelAvailabilityState | null>(null);
 
   useEffect(() => {
     if (textareaRef.current) {
@@ -165,6 +280,50 @@ function PureMultimodalInput({
       setInput(finalValue);
     }
   }, [localStorageInput, setInput]);
+
+  useEffect(() => {
+    let mounted = true;
+
+    const loadSelectedModelAvailability = async () => {
+      const rows = await listLocalModelCacheMeta();
+      const row = rows.find((entry) => entry.modelId === selectedModelId);
+
+      if (!mounted) {
+        return;
+      }
+
+      if (!row) {
+        setSelectedModelAvailability(null);
+        return;
+      }
+
+      const summary = await getLocalModelDownloadSummary(
+        `${row.modelId}:${row.dtype}`
+      );
+
+      if (!mounted) {
+        return;
+      }
+
+      setSelectedModelAvailability({
+        bytesTotal: row.bytesTotal,
+        downloadComplete:
+          summary.totalFiles > 0 &&
+          summary.completedFiles === summary.totalFiles,
+      });
+    };
+
+    const loadPromise = loadSelectedModelAvailability();
+    loadPromise.catch(() => {
+      if (mounted) {
+        setSelectedModelAvailability(null);
+      }
+    });
+
+    return () => {
+      mounted = false;
+    };
+  }, [selectedModelId]);
 
   useEffect(() => {
     setLocalStorageInput(input);
@@ -240,6 +399,11 @@ function PureMultimodalInput({
   const [slashOpen, setSlashOpen] = useState(false);
   const [slashQuery, setSlashQuery] = useState("");
   const [slashIndex, setSlashIndex] = useState(0);
+  const inlineModelStatus = getInlineModelStatus({
+    selectedModelId,
+    modelLoadProgress,
+    availability: selectedModelAvailability ?? undefined,
+  });
 
   const submitForm = useCallback(() => {
     window.history.pushState(
@@ -282,7 +446,7 @@ function PureMultimodalInput({
     chatId,
   ]);
 
-  const uploadFile = useCallback(async (file: File) => {
+  const uploadFile = useCallback((file: File) => {
     try {
       return {
         url: URL.createObjectURL(file),
@@ -376,108 +540,8 @@ function PureMultimodalInput({
     return () => textarea.removeEventListener("paste", handlePaste);
   }, [handlePaste]);
 
-  const loadProgressWidth = (() => {
-    if (!modelLoadProgress) {
-      return 0;
-    }
-
-    if (modelLoadProgress.phase === "downloading") {
-      if (typeof modelLoadProgress.progress === "number") {
-        return Math.max(6, Math.min(98, modelLoadProgress.progress));
-      }
-      if (modelLoadProgress.totalBytes > 0) {
-        const ratio =
-          (modelLoadProgress.loadedBytes / modelLoadProgress.totalBytes) * 100;
-        return Math.max(6, Math.min(98, ratio));
-      }
-      return 40;
-    }
-
-    if (modelLoadProgress.phase === "initializing") {
-      if (typeof modelLoadProgress.progress === "number") {
-        return Math.max(92, Math.min(99, modelLoadProgress.progress));
-      }
-      return modelLoadProgress.totalBytes > 0 ? 96 : 88;
-    }
-
-    if (modelLoadProgress.phase === "ready") {
-      return 100;
-    }
-
-    return 0;
-  })();
-
-  const progressToneClass =
-    modelLoadProgress?.phase === "failed"
-      ? "bg-red-500/80"
-      : modelLoadProgress?.phase === "cancelled"
-        ? "bg-muted-foreground/35"
-        : "bg-foreground";
-
-  const progressSummary = (() => {
-    if (!modelLoadProgress) {
-      return "";
-    }
-
-    const summaryParts: string[] = [];
-
-    if (typeof modelLoadProgress.progress === "number") {
-      summaryParts.push(`${Math.round(modelLoadProgress.progress)}%`);
-    }
-
-    if (modelLoadProgress.totalBytes > 0) {
-      summaryParts.push(
-        `${formatBytes(modelLoadProgress.loadedBytes)} / ${formatBytes(modelLoadProgress.totalBytes)}`
-      );
-    }
-
-    return summaryParts.join(" · ");
-  })();
-
   return (
     <div className={cn("relative flex w-full flex-col gap-4", className)}>
-      {modelLoadProgress && (
-        <div className="rounded-xl border border-border/50 bg-card/80 px-3 py-2.5 shadow-(--shadow-card)">
-          <div className="flex items-center justify-between gap-2">
-            <div className="truncate text-[12px] text-foreground/85">
-              {modelLoadProgress.message}
-            </div>
-
-            <div className="ml-auto flex shrink-0 items-center gap-2 text-[11px] text-muted-foreground">
-              {progressSummary && <span>{progressSummary}</span>}
-
-              {modelLoadProgress.canCancel && onCancelModelLoad && (
-                <button
-                  className="rounded-md px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                  onMouseDown={(event) => {
-                    event.preventDefault();
-                    onCancelModelLoad();
-                  }}
-                  type="button"
-                >
-                  取消
-                </button>
-              )}
-            </div>
-          </div>
-
-          <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-muted/70">
-            <div
-              className={cn(
-                "h-full rounded-full transition-[width] duration-300 ease-out",
-                progressToneClass,
-                (modelLoadProgress.phase === "downloading" ||
-                  modelLoadProgress.phase === "initializing") &&
-                  "animate-pulse"
-              )}
-              style={{
-                width: `${loadProgressWidth}%`,
-              }}
-            />
-          </div>
-        </div>
-      )}
-
       {editingMessage && onCancelEdit && (
         <div className="flex items-center gap-2 text-[12px] text-muted-foreground">
           <span>Editing message</span>
@@ -624,22 +688,32 @@ function PureMultimodalInput({
           value={input}
         />
         <PromptInputFooter className="px-3 pb-3">
-          <PromptInputTools>
-            <AttachmentsButton
-              fileInputRef={fileInputRef}
-              selectedModelId={selectedModelId}
-              status={status}
-            />
-            <ModelSelectorCompact
-              modelLoadProgress={modelLoadProgress}
-              onModelChange={onModelChange}
-              selectedModelId={selectedModelId}
-            />
-            <ReasoningModeToggle
-              onReasoningModeChange={onReasoningModeChange}
-              selectedReasoningMode={selectedReasoningMode}
-            />
-          </PromptInputTools>
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            <PromptInputTools>
+              <AttachmentsButton
+                fileInputRef={fileInputRef}
+                selectedModelId={selectedModelId}
+                status={status}
+              />
+              <ModelSelectorCompact
+                modelLoadProgress={modelLoadProgress}
+                onModelChange={onModelChange}
+                selectedModelId={selectedModelId}
+              />
+              <ReasoningModeToggle
+                onReasoningModeChange={onReasoningModeChange}
+                selectedReasoningMode={selectedReasoningMode}
+              />
+            </PromptInputTools>
+            <div
+              className={cn(
+                "min-w-0 flex-1 truncate text-[11px]",
+                inlineModelStatus.toneClassName
+              )}
+            >
+              {inlineModelStatus.label}
+            </div>
+          </div>
 
           {status === "submitted" ? (
             <StopButton setMessages={setMessages} stop={stop} />
@@ -792,7 +866,9 @@ function PureModelSelectorCompact({
   onModelChange?: (modelId: string) => void;
 }) {
   const [open, setOpen] = useState(false);
-  const [cachedSizeMap, setCachedSizeMap] = useState<Record<string, number>>({});
+  const [availabilityByModelId, setAvailabilityByModelId] = useState<
+    Record<string, LocalModelAvailabilityState>
+  >({});
   const capabilities = localModelCapabilities;
   const activeModels = chatModels;
 
@@ -805,25 +881,46 @@ function PureModelSelectorCompact({
 
     const loadCacheMeta = async () => {
       const rows = await listLocalModelCacheMeta();
+      const latestMetaByModelId = new Map<string, (typeof rows)[number]>();
+
+      for (const row of rows) {
+        if (!latestMetaByModelId.has(row.modelId)) {
+          latestMetaByModelId.set(row.modelId, row);
+        }
+      }
+
+      const availabilityEntries = await Promise.all(
+        Array.from(latestMetaByModelId.values()).map(async (row) => {
+          const summary = await getLocalModelDownloadSummary(
+            `${row.modelId}:${row.dtype}`
+          );
+
+          return [
+            row.modelId,
+            {
+              bytesTotal: row.bytesTotal,
+              downloadComplete:
+                summary.totalFiles > 0 &&
+                summary.completedFiles === summary.totalFiles,
+            },
+          ] as const;
+        })
+      );
+
       if (!mounted) {
         return;
       }
 
-      setCachedSizeMap(
-        Object.fromEntries(
-          rows
-            .filter((row) => row.bytesTotal > 0)
-            .map((row) => [row.modelId, row.bytesTotal])
-        )
-      );
+      setAvailabilityByModelId(Object.fromEntries(availabilityEntries));
     };
 
-    void loadCacheMeta();
+    const loadCacheMetaPromise = loadCacheMeta();
+    loadCacheMetaPromise.catch(() => undefined);
 
     return () => {
       mounted = false;
     };
-  }, [open, modelLoadProgress?.phase, modelLoadProgress?.modelId]);
+  }, [open]);
 
   const selectedModel =
     activeModels.find((m: ChatModel) => m.id === selectedModelId) ??
@@ -855,7 +952,9 @@ function PureModelSelectorCompact({
               { model: ChatModel; curated: boolean }[]
             > = {};
             for (const model of allModels) {
-              const key = curatedIds.has(model.id) ? "_available" : model.provider;
+              const key = curatedIds.has(model.id)
+                ? "_available"
+                : model.provider;
               if (!grouped[key]) {
                 grouped[key] = [];
               }
@@ -901,7 +1000,7 @@ function PureModelSelectorCompact({
               <ModelSelectorGroup
                 heading={
                   key === "_available"
-                    ? "Available"
+                    ? "可选模型"
                     : (providerNames[key] ?? key)
                 }
                 key={key}
@@ -921,9 +1020,18 @@ function PureModelSelectorCompact({
                         : "加载中..."
                     : null;
 
-                  const cachedBytes = cachedSizeMap[model.id] ?? 0;
+                  const availability = availabilityByModelId[model.id];
+                  const availabilityStatus = resolveModelAvailabilityStatus({
+                    modelId: model.id,
+                    modelLoadProgress,
+                    availability,
+                  });
+
+                  const cachedBytes = availability?.bytesTotal ?? 0;
                   const cachedSizeLabel =
-                    cachedBytes > 0 ? `${formatBytes(cachedBytes)} (已缓存)` : null;
+                    cachedBytes > 0
+                      ? `已缓存 ${formatBytes(cachedBytes)}`
+                      : null;
 
                   const estimatedSizeLabel =
                     model.estimatedSizeBytes > 0
@@ -961,7 +1069,17 @@ function PureModelSelectorCompact({
                     >
                       <ModelSelectorLogo provider={logoProvider} />
                       <div className="flex min-w-0 flex-1 flex-col">
-                        <ModelSelectorName>{model.name}</ModelSelectorName>
+                        <div className="flex min-w-0 items-center gap-2">
+                          <ModelSelectorName>{model.name}</ModelSelectorName>
+                          <Badge
+                            className="h-4 px-1.5 text-[10px]"
+                            variant={
+                              availabilityVariantByStatus[availabilityStatus]
+                            }
+                          >
+                            {availabilityLabelByStatus[availabilityStatus]}
+                          </Badge>
+                        </div>
                         <span className="truncate text-[11px] text-muted-foreground">
                           {modelSizeLabel}
                         </span>
