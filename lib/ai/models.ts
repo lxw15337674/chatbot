@@ -45,6 +45,13 @@ export const chatModels: ChatModel[] = [
     description: "Higher quality Qwen option with larger runtime footprint",
     estimatedSizeBytes: Math.round(1035 * 1024 * 1024),
   },
+  {
+    id: "onnx-community/Qwen3.5-2B-ONNX",
+    name: "Qwen3.5 2B (INT4)",
+    provider: "onnx-community",
+    description: "Higher-quality local Qwen model in INT4 format",
+    estimatedSizeBytes: Math.round(1900 * 1024 * 1024),
+  },
 ];
 
 export const localModelCapabilities: Record<string, ModelCapabilities> =

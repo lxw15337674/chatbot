@@ -63,6 +63,7 @@ const MODEL_CACHE_KEY = "chatbot-transformers-cache-v1";
 const CHINESE_PRIORITY_MODEL_IDS = new Set([
   "onnx-community/Qwen2.5-0.5B-Instruct",
   "onnx-community/Qwen3.5-0.8B-ONNX",
+  "onnx-community/Qwen3.5-2B-ONNX",
 ]);
 let transformersEnvInitialized = false;
 
@@ -695,7 +696,7 @@ export async function generateLocalAssistantResponse(params: {
       !CHINESE_PRIORITY_MODEL_IDS.has(modelId)
     ) {
       text =
-        "当前模型对中文支持不稳定，建议切换到 Qwen2.5 0.5B 或 Qwen3.5 0.8B 后再试。";
+        "当前模型对中文支持不稳定，建议切换到 Qwen2.5 0.5B、Qwen3.5 0.8B 或 Qwen3.5 2B (INT4) 后再试。";
     }
   }
 
