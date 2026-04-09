@@ -1,12 +1,18 @@
+import {
+  getLocalModelDtypeCandidates,
+  type LocalModelDtype,
+} from "@/lib/ai/models";
 import { getTextFromMessage } from "@/lib/utils";
 import {
-  getLocalModelDownloadSummary,
+  clearLocalModelDownloadRecords,
+  getLocalModelCacheMeta,
+  saveLocalModelAssetState,
   saveLocalModelCacheMeta,
   upsertLocalModelDownloadRecord,
 } from "./local-chat-store";
 import type { ChatMessage } from "./types";
 
-type LocalDtype = "q4f16" | "q4" | "q8" | "fp16" | "fp32";
+type LocalDtype = LocalModelDtype;
 
 type LocalLoadMeta = {
   bytesTotal: number;
@@ -50,6 +56,23 @@ type RuntimeLoadOptions = {
   isLoadCancelled?: () => boolean;
 };
 
+type CacheCheckResult = {
+  allCached: boolean;
+  files: Array<{
+    file: string;
+    cached: boolean;
+  }>;
+};
+
+type VerifiedLocalModelAssetState = {
+  modelId: string;
+  status: "missing" | "partial" | "complete";
+  dtype: LocalDtype | null;
+  bytesTotal: number;
+  fileCount: number;
+  cachedFileCount: number;
+};
+
 type ModelRuntime = {
   generator: any;
   device: "webgpu" | "wasm";
@@ -66,6 +89,16 @@ const CHINESE_PRIORITY_MODEL_IDS = new Set([
   "onnx-community/Qwen3.5-2B-ONNX",
 ]);
 let transformersEnvInitialized = false;
+const LOCAL_INFERENCE_DEBUG_PREFIX = "[local-inference]";
+
+function logLocalInference(message: string, details?: Record<string, unknown>) {
+  if (details) {
+    console.info(LOCAL_INFERENCE_DEBUG_PREFIX, message, details);
+    return;
+  }
+
+  console.info(LOCAL_INFERENCE_DEBUG_PREFIX, message);
+}
 
 function emitLoadProgress(
   options: RuntimeLoadOptions | undefined,
@@ -78,71 +111,12 @@ function emitLoadProgress(
   options?.onLoadProgress?.(event);
 }
 
-function toLoadProgressEvent(info: HubProgressInfo): LocalModelLoadProgressEvent {
-  switch (info.status) {
-    case "initiate":
-    case "download":
-      return {
-        phase: "downloading",
-        message: "正在下载模型文件...",
-        progress: null,
-        loaded: 0,
-        total: 0,
-      };
-    case "progress":
-    case "progress_total": {
-      const loaded = typeof info.loaded === "number" ? info.loaded : 0;
-      const total = typeof info.total === "number" ? info.total : 0;
-      const progressValue =
-        typeof info.progress === "number"
-          ? Math.max(0, Math.min(100, info.progress))
-          : total > 0
-            ? Math.max(0, Math.min(100, (loaded / total) * 100))
-          : null;
-
-      return {
-        phase: "downloading",
-        message:
-          progressValue === null
-            ? "正在下载模型文件..."
-            : `正在下载模型文件 (${Math.round(progressValue)}%)${info.file ? ` · ${info.file}` : ""}`,
-        progress: progressValue,
-        loaded,
-        total,
-      };
-    }
-    case "done":
-      return {
-        phase: "initializing",
-        message: "正在初始化推理引擎...",
-        progress: null,
-        loaded: typeof info.loaded === "number" ? info.loaded : 0,
-        total: typeof info.total === "number" ? info.total : 0,
-      };
-    case "ready":
-      return {
-        phase: "ready",
-        message: "模型已就绪",
-        progress: 100,
-        loaded: 0,
-        total: 0,
-      };
-    default:
-      return {
-        phase: "initializing",
-        message: "正在初始化推理引擎...",
-        progress: null,
-        loaded: 0,
-        total: 0,
-      };
-  }
-}
-
 function hasWebGpuSupport() {
   return typeof navigator !== "undefined" && "gpu" in navigator;
 }
 
 function initializeTransformersEnv(env: {
+  allowRemoteModels?: boolean;
   useBrowserCache?: boolean;
   useWasmCache?: boolean;
   useCustomCache?: boolean;
@@ -160,16 +134,542 @@ function initializeTransformersEnv(env: {
   transformersEnvInitialized = true;
 }
 
-async function resolveDtype(modelId: string): Promise<LocalDtype> {
-  try {
-    const { ModelRegistry } = await import("@huggingface/transformers");
-    const available = await ModelRegistry.get_available_dtypes(modelId);
-    const preferred: LocalDtype[] = ["q4f16", "q4", "q8", "fp16", "fp32"];
+function resolveDtypeCandidates(modelId: string): LocalDtype[] {
+  return getLocalModelDtypeCandidates(modelId);
+}
 
-    return preferred.find((dtype) => available.includes(dtype)) ?? "q4";
-  } catch {
-    return "q4";
+type TransformersInternals = {
+  env: {
+    allowRemoteModels?: boolean;
+    useBrowserCache?: boolean;
+    useWasmCache?: boolean;
+    useCustomCache?: boolean;
+    cacheKey?: string;
+  };
+  pipeline: typeof import("@huggingface/transformers").pipeline;
+  getModelFile: (
+    pathOrRepoId: string,
+    filename: string,
+    fatal?: boolean,
+    options?: Record<string, unknown>,
+    returnPath?: boolean
+  ) => Promise<string | Uint8Array>;
+  get_pipeline_files: (
+    task: string,
+    modelId: string,
+    options?: Record<string, unknown>
+  ) => Promise<string[]>;
+  is_pipeline_cached_files: (
+    task: string,
+    modelId: string,
+    options?: Record<string, unknown>
+  ) => Promise<CacheCheckResult>;
+  get_file_metadata: (
+    pathOrRepoId: string,
+    filename: string,
+    options?: Record<string, unknown>
+  ) => Promise<{
+    exists: boolean;
+    size?: number;
+    fromCache?: boolean;
+  }>;
+};
+
+let transformersInternalsPromise: Promise<TransformersInternals> | null = null;
+
+async function getTransformersInternals(): Promise<TransformersInternals> {
+  if (!transformersInternalsPromise) {
+    transformersInternalsPromise = (async () => {
+      const [
+        transformersModule,
+        hubModule,
+        getPipelineFilesModule,
+        isCachedModule,
+        getFileMetadataModule,
+      ] = await Promise.all([
+        import("@huggingface/transformers"),
+        // @ts-expect-error Internal Transformers.js source import with no bundled typings.
+        import("../node_modules/@huggingface/transformers/src/utils/hub.js"),
+        // @ts-expect-error Internal Transformers.js source import with no bundled typings.
+        import("../node_modules/@huggingface/transformers/src/utils/model_registry/get_pipeline_files.js"),
+        // @ts-expect-error Internal Transformers.js source import with no bundled typings.
+        import("../node_modules/@huggingface/transformers/src/utils/model_registry/is_cached.js"),
+        // @ts-expect-error Internal Transformers.js source import with no bundled typings.
+        import("../node_modules/@huggingface/transformers/src/utils/model_registry/get_file_metadata.js"),
+      ]);
+
+      initializeTransformersEnv(transformersModule.env);
+
+      return {
+        env: transformersModule.env,
+        pipeline: transformersModule.pipeline,
+        getModelFile: hubModule.getModelFile,
+        get_pipeline_files: getPipelineFilesModule.get_pipeline_files,
+        is_pipeline_cached_files: isCachedModule.is_pipeline_cached_files,
+        get_file_metadata: getFileMetadataModule.get_file_metadata,
+      } satisfies TransformersInternals;
+    })();
   }
+
+  return transformersInternalsPromise;
+}
+
+function isMissingLocalAssetError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  return /could not locate file|local files only|local_files_only/i.test(
+    error.message
+  );
+}
+
+function shouldFallbackToWasm(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  return /webgpu|gpu adapter|gpu device|wasm backend|backend.*not available|not supported/i.test(
+    error.message
+  );
+}
+
+async function getLocalPipelineCacheStatus(
+  modelId: string,
+  dtype: LocalDtype
+): Promise<CacheCheckResult> {
+  try {
+    const internals = await getTransformersInternals();
+
+    return await internals.is_pipeline_cached_files("text-generation", modelId, {
+      dtype,
+      local_files_only: true,
+      revision: "main",
+    });
+  } catch (error) {
+    logLocalInference("assets:local-cache-check:error", {
+      modelId,
+      dtype,
+      message: error instanceof Error ? error.message : String(error),
+    });
+
+    return {
+      allCached: false,
+      files: [],
+    };
+  }
+}
+
+async function getCachedFilesMeta(modelId: string, files: string[]) {
+  const internals = await getTransformersInternals();
+  let bytesTotal = 0;
+
+  await Promise.all(
+    files.map(async (file) => {
+      const metadata = await internals.get_file_metadata(modelId, file, {
+        local_files_only: true,
+        revision: "main",
+      });
+
+      if (typeof metadata.size === "number") {
+        bytesTotal += metadata.size;
+      }
+    })
+  );
+
+  return {
+    bytesTotal,
+    fileCount: files.length,
+  };
+}
+
+export async function getVerifiedLocalModelAssetState(
+  modelId: string
+): Promise<VerifiedLocalModelAssetState> {
+  const cacheMeta = await getLocalModelCacheMeta(modelId).catch(() => null);
+  const dtypeCandidates = Array.from(
+    new Set([
+      cacheMeta?.dtype,
+      ...resolveDtypeCandidates(modelId),
+    ].filter((value): value is LocalDtype => Boolean(value)))
+  );
+
+  let bestPartial: VerifiedLocalModelAssetState | null = null;
+
+  for (const dtype of dtypeCandidates) {
+    const cacheStatus = await getLocalPipelineCacheStatus(modelId, dtype);
+    const cachedFiles = cacheStatus.files.filter((entry) => entry.cached);
+
+    if (cacheStatus.allCached && cacheStatus.files.length > 0) {
+      const cachedMeta = await getCachedFilesMeta(
+        modelId,
+        cacheStatus.files.map((entry) => entry.file)
+      );
+      const snapshot = {
+        modelId,
+        status: "complete",
+        dtype,
+        bytesTotal: cachedMeta.bytesTotal,
+        fileCount: cachedMeta.fileCount,
+        cachedFileCount: cacheStatus.files.length,
+      } satisfies VerifiedLocalModelAssetState;
+
+      await saveLocalModelAssetState({
+        modelId,
+        status: "complete",
+        bytesTotal: snapshot.bytesTotal,
+        fileCount: snapshot.fileCount,
+      });
+
+      return snapshot;
+    }
+
+    if (cachedFiles.length > 0) {
+      const cachedMeta = await getCachedFilesMeta(
+        modelId,
+        cachedFiles.map((entry) => entry.file)
+      );
+      const snapshot = {
+        modelId,
+        status: "partial",
+        dtype,
+        bytesTotal: cachedMeta.bytesTotal,
+        fileCount: cacheStatus.files.length,
+        cachedFileCount: cachedFiles.length,
+      } satisfies VerifiedLocalModelAssetState;
+
+      if (
+        !bestPartial ||
+        snapshot.cachedFileCount > bestPartial.cachedFileCount
+      ) {
+        bestPartial = snapshot;
+      }
+    }
+  }
+
+  if (bestPartial) {
+    await saveLocalModelAssetState({
+      modelId,
+      status: "partial",
+      bytesTotal: bestPartial.bytesTotal,
+      fileCount: bestPartial.fileCount,
+    });
+    return bestPartial;
+  }
+
+  await saveLocalModelAssetState({
+    modelId,
+    status: "missing",
+    bytesTotal: 0,
+    fileCount: 0,
+  });
+
+  return {
+    modelId,
+    status: "missing",
+    dtype: null,
+    bytesTotal: 0,
+    fileCount: 0,
+    cachedFileCount: 0,
+  };
+}
+
+export async function ensureLocalModelAssets(params: {
+  modelId: string;
+  onLoadProgress?: (event: LocalModelLoadProgressEvent) => void;
+  isLoadCancelled?: () => boolean;
+}): Promise<{
+  dtype: LocalDtype;
+  bytesTotal: number;
+  fileCount: number;
+}> {
+  const { modelId } = params;
+  const existing = await getVerifiedLocalModelAssetState(modelId);
+
+  if (existing.status === "complete" && existing.dtype) {
+    logLocalInference("assets:already-complete", {
+      modelId,
+      dtype: existing.dtype,
+      bytesTotal: existing.bytesTotal,
+      fileCount: existing.fileCount,
+    });
+
+    return {
+      dtype: existing.dtype,
+      bytesTotal: existing.bytesTotal,
+      fileCount: existing.fileCount,
+    };
+  }
+
+  const internals = await getTransformersInternals();
+  const dtypeCandidates = Array.from(
+    new Set([
+      existing.dtype,
+      ...resolveDtypeCandidates(modelId),
+    ].filter((value): value is LocalDtype => Boolean(value)))
+  );
+
+  let lastError: unknown = null;
+
+  for (const dtype of dtypeCandidates) {
+    if (params.isLoadCancelled?.()) {
+      throw new Error("Model load cancelled");
+    }
+
+    const modelKey = `${modelId}:${dtype}`;
+    const localCacheStatus = await getLocalPipelineCacheStatus(modelId, dtype);
+    let requiredFiles = localCacheStatus.files.map((entry) => entry.file);
+
+    if (requiredFiles.length === 0) {
+      try {
+        requiredFiles = await internals.get_pipeline_files(
+          "text-generation",
+          modelId,
+          {
+            dtype,
+            revision: "main",
+          }
+        );
+      } catch (error) {
+        lastError = error;
+        logLocalInference("assets:get-required-files:error", {
+          modelId,
+          dtype,
+          message: error instanceof Error ? error.message : String(error),
+        });
+        continue;
+      }
+    }
+
+    const cachedByFile = new Map(
+      localCacheStatus.files.map((entry) => [entry.file, entry.cached])
+    );
+    const missingFiles = requiredFiles.filter(
+      (file) => !cachedByFile.get(file)
+    );
+
+    if (missingFiles.length === 0) {
+      const verified = await getVerifiedLocalModelAssetState(modelId);
+      if (verified.status === "complete" && verified.dtype) {
+        return {
+          dtype: verified.dtype,
+          bytesTotal: verified.bytesTotal,
+          fileCount: verified.fileCount,
+        };
+      }
+      continue;
+    }
+
+    await clearLocalModelDownloadRecords(modelKey);
+    await saveLocalModelAssetState({
+      modelId,
+      status: "partial",
+      fileCount: requiredFiles.length,
+    });
+
+    for (const file of requiredFiles) {
+      if (cachedByFile.get(file)) {
+        void upsertLocalModelDownloadRecord({
+          modelKey,
+          modelId,
+          dtype,
+          file,
+          status: "done",
+          loadedBytes: 0,
+          totalBytes: 0,
+        });
+      }
+    }
+
+    const progressByFile = new Map<
+      string,
+      {
+        loaded: number;
+        total: number;
+        done: boolean;
+      }
+    >();
+
+    const emitAggregateProgress = (currentFile?: string) => {
+      let loaded = 0;
+      let total = 0;
+      let completedFiles = 0;
+
+      for (const file of missingFiles) {
+        const progress = progressByFile.get(file);
+        if (!progress) {
+          continue;
+        }
+
+        loaded += progress.loaded;
+        total += progress.total;
+        if (progress.done) {
+          completedFiles += 1;
+        }
+      }
+
+      const progressValue =
+        total > 0
+          ? Math.max(0, Math.min(100, (loaded / total) * 100))
+          : Math.max(
+              0,
+              Math.min(100, (completedFiles / missingFiles.length) * 100)
+            );
+
+      emitLoadProgress(params, {
+        phase: "downloading",
+        message: `正在下载模型文件 (${completedFiles}/${missingFiles.length})${currentFile ? ` · ${currentFile}` : ""}`,
+        progress: Number.isFinite(progressValue) ? progressValue : null,
+        loaded,
+        total,
+      });
+    };
+
+    logLocalInference("assets:download:start", {
+      modelId,
+      dtype,
+      requiredFiles,
+      missingFiles,
+    });
+
+    try {
+      for (const file of missingFiles) {
+        if (params.isLoadCancelled?.()) {
+          throw new Error("Model load cancelled");
+        }
+
+        progressByFile.set(file, {
+          loaded: 0,
+          total: 0,
+          done: false,
+        });
+        emitAggregateProgress(file);
+
+        await internals.getModelFile(modelId, file, true, {
+          revision: "main",
+          local_files_only: false,
+          progress_callback: (info: HubProgressInfo) => {
+            if (params.isLoadCancelled?.()) {
+              return;
+            }
+
+            const fileName = info.file ?? file;
+            const previous = progressByFile.get(fileName) ?? {
+              loaded: 0,
+              total: 0,
+              done: false,
+            };
+            const next = {
+              loaded:
+                typeof info.loaded === "number"
+                  ? Math.max(previous.loaded, info.loaded)
+                  : previous.loaded,
+              total:
+                typeof info.total === "number" && info.total > 0
+                  ? Math.max(previous.total, info.total)
+                  : previous.total,
+              done:
+                info.status === "done" || info.status === "ready"
+                  ? true
+                  : previous.done,
+            };
+
+            progressByFile.set(fileName, next);
+
+            if (
+              info.status === "initiate" ||
+              info.status === "download" ||
+              info.status === "progress" ||
+              info.status === "progress_total"
+            ) {
+              void saveLocalModelAssetState({
+                modelId,
+                status: "partial",
+                fileCount: requiredFiles.length,
+              });
+              void upsertLocalModelDownloadRecord({
+                modelKey,
+                modelId,
+                dtype,
+                file: fileName,
+                status: "downloading",
+                loadedBytes: next.loaded,
+                totalBytes: next.total,
+              });
+            }
+
+            if (info.status === "done" || info.status === "ready") {
+              void upsertLocalModelDownloadRecord({
+                modelKey,
+                modelId,
+                dtype,
+                file: fileName,
+                status: "done",
+                loadedBytes: next.total > 0 ? next.total : next.loaded,
+                totalBytes: next.total,
+              });
+            }
+
+            emitAggregateProgress(fileName);
+          },
+        });
+
+        const fileProgress = progressByFile.get(file);
+        progressByFile.set(file, {
+          loaded: fileProgress?.total ?? fileProgress?.loaded ?? 0,
+          total: fileProgress?.total ?? fileProgress?.loaded ?? 0,
+          done: true,
+        });
+        await upsertLocalModelDownloadRecord({
+          modelKey,
+          modelId,
+          dtype,
+          file,
+          status: "done",
+          loadedBytes: fileProgress?.total ?? fileProgress?.loaded ?? 0,
+          totalBytes: fileProgress?.total ?? fileProgress?.loaded ?? 0,
+        });
+        emitAggregateProgress(file);
+      }
+
+      const verified = await getVerifiedLocalModelAssetState(modelId);
+      if (verified.status === "complete" && verified.dtype) {
+        logLocalInference("assets:download:complete", {
+          modelId,
+          dtype: verified.dtype,
+          bytesTotal: verified.bytesTotal,
+          fileCount: verified.fileCount,
+        });
+
+        return {
+          dtype: verified.dtype,
+          bytesTotal: verified.bytesTotal,
+          fileCount: verified.fileCount,
+        };
+      }
+    } catch (error) {
+      lastError = error;
+      logLocalInference("assets:download:error", {
+        modelId,
+        dtype,
+        message: error instanceof Error ? error.message : String(error),
+      });
+
+      await saveLocalModelAssetState({
+        modelId,
+        status: "partial",
+        fileCount: requiredFiles.length,
+      });
+
+      if (params.isLoadCancelled?.()) {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(`Failed to download required assets for ${modelId}`);
 }
 
 async function getRuntime(
@@ -177,136 +677,141 @@ async function getRuntime(
   options?: RuntimeLoadOptions
 ): Promise<ModelRuntime> {
   const preferredDevice = hasWebGpuSupport() ? "webgpu" : "wasm";
-  const dtype = await resolveDtype(modelId);
-  const modelKey = `${modelId}:${dtype}`;
-  const key = `${modelId}:${preferredDevice}:${dtype}`;
+  const key = `${modelId}:runtime`;
+  const existing = runtimes.get(key);
+  if (existing) {
+    logLocalInference("getRuntime:reuse-existing-runtime", {
+      modelId,
+      cacheKey: key,
+    });
+    const runtime = await existing;
+    if (options?.isLoadCancelled?.()) {
+      logLocalInference("getRuntime:cancelled-after-reuse", {
+        modelId,
+        cacheKey: key,
+      });
+      throw new Error("Model load cancelled");
+    }
+    logLocalInference("getRuntime:reuse-existing-runtime:done", {
+      modelId,
+      device: runtime.device,
+      dtype: runtime.dtype,
+    });
+    return runtime;
+  }
+
+  const verifiedAssets = await getVerifiedLocalModelAssetState(modelId);
+  const dtypeCandidates = Array.from(
+    new Set([
+      verifiedAssets.dtype,
+      ...resolveDtypeCandidates(modelId),
+    ].filter((value): value is LocalDtype => Boolean(value)))
+  );
+  logLocalInference("getRuntime:start", {
+    modelId,
+    preferredDevice,
+    dtypeCandidates,
+    verifiedAssetStatus: verifiedAssets.status,
+    cacheKey: key,
+  });
 
   emitLoadProgress(options, {
     phase: "initializing",
-    message: "正在准备模型加载...",
+    message: "正在初始化推理引擎...",
     progress: null,
     loaded: 0,
     total: 0,
   });
 
-  const existing = runtimes.get(key);
-  if (existing) {
-    const runtime = await existing;
-    if (options?.isLoadCancelled?.()) {
-      throw new Error("Model load cancelled");
-    }
-    return runtime;
-  }
-
   const loading = (async () => {
-    const { env, pipeline } = await import("@huggingface/transformers");
-    initializeTransformersEnv(env);
+    const { pipeline } = await getTransformersInternals();
 
-    const persistedAtByFile = new Map<string, number>();
-    const persistDownloadRecord = (params: {
-      file: string;
-      status: "downloading" | "done" | "failed";
-      loadedBytes: number;
-      totalBytes: number;
-      force?: boolean;
-    }) => {
-      const file = params.file || "unknown";
-      const now = Date.now();
-      const lastPersistedAt = persistedAtByFile.get(file) ?? 0;
+    const createRuntimeForDevice = async (
+      device: "webgpu" | "wasm"
+    ): Promise<ModelRuntime> => {
+      let lastError: unknown = null;
 
-      if (!params.force && now - lastPersistedAt < 800) {
-        return;
+      for (const dtype of dtypeCandidates) {
+        try {
+          logLocalInference("getRuntime:create-pipeline", {
+            modelId,
+            device,
+            dtype,
+            localFilesOnly: true,
+          });
+          const generator = await pipeline("text-generation", modelId, {
+            device,
+            dtype,
+            local_files_only: true,
+          });
+
+          const loadMeta = extractLoadMeta(generator);
+          logLocalInference("getRuntime:create-pipeline:done", {
+            modelId,
+            device,
+            dtype,
+            bytesTotal: loadMeta.bytesTotal,
+            fileCount: loadMeta.fileCount,
+            fromCacheCount: loadMeta.fromCacheCount,
+          });
+          void saveLocalModelAssetState({
+            modelId,
+            status: "complete",
+            bytesTotal: loadMeta.bytesTotal,
+            fileCount: loadMeta.fileCount,
+          });
+          void saveLocalModelCacheMeta({
+            modelId,
+            dtype,
+            device,
+            ...loadMeta,
+          });
+
+          return {
+            generator,
+            device,
+            dtype,
+            loadMeta,
+          } satisfies ModelRuntime;
+        } catch (error) {
+          lastError = error;
+          logLocalInference("getRuntime:create-pipeline:error", {
+            modelId,
+            device,
+            dtype,
+            message: error instanceof Error ? error.message : String(error),
+          });
+
+          if (isMissingLocalAssetError(error)) {
+            await saveLocalModelAssetState({
+              modelId,
+              status: "partial",
+            });
+          }
+        }
       }
 
-      persistedAtByFile.set(file, now);
-
-      void upsertLocalModelDownloadRecord({
-        modelKey,
+      await saveLocalModelAssetState({
         modelId,
-        dtype,
-        file,
-        status: params.status,
-        loadedBytes: params.loadedBytes,
-        totalBytes: params.totalBytes,
-        updatedAt: now,
+        status: "partial",
       });
-    };
-
-    const downloadSummary = await getLocalModelDownloadSummary(modelKey);
-    if (downloadSummary.hasPartial) {
-      const resumedProgress =
-        downloadSummary.totalFiles > 0
-          ? (downloadSummary.completedFiles / downloadSummary.totalFiles) * 100
-          : null;
-
-      emitLoadProgress(options, {
-        phase: "downloading",
-        message: `检测到未完成下载，正在续传 (${downloadSummary.completedFiles}/${downloadSummary.totalFiles})...`,
-        progress: resumedProgress,
-        loaded: 0,
-        total: 0,
-      });
-    }
-
-    const progressCallback = (progressInfo: HubProgressInfo) => {
-      emitLoadProgress(options, toLoadProgressEvent(progressInfo));
-
-      const file = progressInfo.file;
-      if (!file) {
-        return;
-      }
-
-      if (progressInfo.status === "done") {
-        persistDownloadRecord({
-          file,
-          status: "done",
-          loadedBytes:
-            typeof progressInfo.loaded === "number" ? progressInfo.loaded : 0,
-          totalBytes:
-            typeof progressInfo.total === "number" ? progressInfo.total : 0,
-          force: true,
-        });
-        return;
-      }
-
-      if (
-        progressInfo.status === "initiate" ||
-        progressInfo.status === "download" ||
-        progressInfo.status === "progress"
-      ) {
-        persistDownloadRecord({
-          file,
-          status: "downloading",
-          loadedBytes:
-            typeof progressInfo.loaded === "number" ? progressInfo.loaded : 0,
-          totalBytes:
-            typeof progressInfo.total === "number" ? progressInfo.total : 0,
-        });
-      }
+      throw lastError instanceof Error
+        ? lastError
+        : new Error(`Failed to create runtime for ${modelId}`);
     };
 
     try {
-      const generator = await pipeline("text-generation", modelId, {
-        device: preferredDevice,
-        dtype,
-        progress_callback: progressCallback,
-      });
+      return await createRuntimeForDevice(preferredDevice);
+    } catch (primaryError) {
+      if (preferredDevice === "wasm" || !shouldFallbackToWasm(primaryError)) {
+        throw primaryError;
+      }
 
-      const loadMeta = extractLoadMeta(generator);
-      void saveLocalModelCacheMeta({
+      logLocalInference("getRuntime:create-pipeline:fallback-to-wasm", {
         modelId,
-        dtype,
-        device: preferredDevice,
-        ...loadMeta,
+        message:
+          primaryError instanceof Error ? primaryError.message : String(primaryError),
       });
-
-      return {
-        generator,
-        device: preferredDevice,
-        dtype,
-        loadMeta,
-      } satisfies ModelRuntime;
-    } catch {
       emitLoadProgress(options, {
         phase: "initializing",
         message: "WebGPU 不可用，正在回退到 WASM...",
@@ -315,50 +820,37 @@ async function getRuntime(
         total: 0,
       });
 
-      try {
-        const fallbackGenerator = await pipeline("text-generation", modelId, {
-          device: "wasm",
-          dtype,
-          progress_callback: progressCallback,
-        });
-
-        const loadMeta = extractLoadMeta(fallbackGenerator);
-        void saveLocalModelCacheMeta({
-          modelId,
-          dtype,
-          device: "wasm",
-          ...loadMeta,
-        });
-
-        return {
-          generator: fallbackGenerator,
-          device: "wasm",
-          dtype,
-          loadMeta,
-        } satisfies ModelRuntime;
-      } catch (fallbackError) {
-        persistDownloadRecord({
-          file: "runtime",
-          status: "failed",
-          loadedBytes: 0,
-          totalBytes: 0,
-          force: true,
-        });
-
-        throw fallbackError;
-      }
+      return createRuntimeForDevice("wasm");
     }
   })();
 
   runtimes.set(key, loading);
-  const runtime = await loading;
-  loadedModelIds.add(modelId);
 
-  if (options?.isLoadCancelled?.()) {
-    throw new Error("Model load cancelled");
+  try {
+    const runtime = await loading;
+    loadedModelIds.add(modelId);
+    logLocalInference("getRuntime:ready", {
+      modelId,
+      device: runtime.device,
+      dtype: runtime.dtype,
+    });
+
+    if (options?.isLoadCancelled?.()) {
+      logLocalInference("getRuntime:cancelled-after-ready", {
+        modelId,
+      });
+      throw new Error("Model load cancelled");
+    }
+
+    return runtime;
+  } catch (error) {
+    logLocalInference("getRuntime:error", {
+      modelId,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    runtimes.delete(key);
+    throw error;
   }
-
-  return runtime;
 }
 
 function normalizeGeneratedText(output: unknown): string {
@@ -594,9 +1086,19 @@ export async function generateLocalAssistantResponse(params: {
     onLoadProgress,
     isLoadCancelled,
   } = params;
+  logLocalInference("generate:start", {
+    modelId,
+    reasoningMode,
+    messageCount: messages.length,
+  });
   const runtime = await getRuntime(modelId, {
     onLoadProgress,
     isLoadCancelled,
+  });
+  logLocalInference("generate:runtime-ready", {
+    modelId,
+    device: runtime.device,
+    dtype: runtime.dtype,
   });
 
   const promptMessages = messages
@@ -623,19 +1125,35 @@ export async function generateLocalAssistantResponse(params: {
   let generationInput: typeof promptMessages | string = promptMessages;
 
   try {
+    logLocalInference("generate:invoke-generator", {
+      modelId,
+      inputType: "messages",
+      promptMessageCount: promptMessages.length,
+    });
     output = await runtime.generator(promptMessages, generationOptions);
   } catch (error) {
     if (!isChatTemplateMissingError(error)) {
+      logLocalInference("generate:invoke-generator:error", {
+        modelId,
+        message: error instanceof Error ? error.message : String(error),
+      });
       throw error;
     }
 
     const plainPrompt = buildPlainPrompt(promptMessages);
     plainPromptUsed = plainPrompt;
     generationInput = plainPrompt;
+    logLocalInference("generate:invoke-generator:fallback-plain-prompt", {
+      modelId,
+      promptLength: plainPrompt.length,
+    });
     output = await runtime.generator(plainPrompt, generationOptions);
   }
 
   if (signal?.aborted) {
+    logLocalInference("generate:aborted-after-generator", {
+      modelId,
+    });
     throw new Error("Generation aborted");
   }
 
@@ -653,6 +1171,9 @@ export async function generateLocalAssistantResponse(params: {
 
   if (looksLikeGarbledText(text)) {
     try {
+      logLocalInference("generate:retry-deterministic", {
+        modelId,
+      });
       const retryOutput = await runtime.generator(
         generationInput,
         createGenerationOptions({
@@ -682,6 +1203,9 @@ export async function generateLocalAssistantResponse(params: {
       }
     } catch {
       // Keep original text and fall through to model suggestion handling.
+      logLocalInference("generate:retry-deterministic:failed", {
+        modelId,
+      });
     }
   }
 
@@ -718,15 +1242,20 @@ export async function prepareLocalModel(params: {
   device: "webgpu" | "wasm";
   loadMeta: LocalLoadMeta;
 }> {
-  const runtime = await getRuntime(params.modelId, {
+  const assets = await ensureLocalModelAssets({
+    modelId: params.modelId,
     onLoadProgress: params.onLoadProgress,
     isLoadCancelled: params.isLoadCancelled,
   });
 
   return {
-    dtype: runtime.dtype,
-    device: runtime.device,
-    loadMeta: runtime.loadMeta,
+    dtype: assets.dtype,
+    device: hasWebGpuSupport() ? "webgpu" : "wasm",
+    loadMeta: {
+      bytesTotal: assets.bytesTotal,
+      fileCount: assets.fileCount,
+      fromCacheCount: 0,
+    },
   };
 }
 

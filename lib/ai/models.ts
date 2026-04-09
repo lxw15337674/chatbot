@@ -1,5 +1,7 @@
 export const DEFAULT_CHAT_MODEL = "onnx-community/Qwen3-0.6B-ONNX";
 
+export type LocalModelDtype = "q4f16" | "q4" | "q8" | "fp16" | "fp32";
+
 export const titleModel = {
   id: "onnx-community/Qwen2.5-0.5B-Instruct",
   name: "Qwen2.5 0.5B Instruct",
@@ -19,6 +21,8 @@ export type ChatModel = {
   provider: string;
   description: string;
   estimatedSizeBytes: number;
+  preferredDtype?: LocalModelDtype;
+  fallbackDtypes?: LocalModelDtype[];
   gatewayOrder?: string[];
   reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high";
 };
@@ -30,6 +34,8 @@ export const chatModels: ChatModel[] = [
     provider: "onnx-community",
     description: "Default local Qwen model with balanced speed and quality",
     estimatedSizeBytes: Math.round(620 * 1024 * 1024),
+    preferredDtype: "q4f16",
+    fallbackDtypes: ["q4", "q8"],
   },
   {
     id: "onnx-community/Qwen2.5-0.5B-Instruct",
@@ -37,6 +43,8 @@ export const chatModels: ChatModel[] = [
     provider: "onnx-community",
     description: "Stable local Qwen model for broad compatibility",
     estimatedSizeBytes: Math.round(483 * 1024 * 1024),
+    preferredDtype: "q4f16",
+    fallbackDtypes: ["q4", "q8"],
   },
   {
     id: "onnx-community/Qwen3.5-0.8B-ONNX",
@@ -44,6 +52,8 @@ export const chatModels: ChatModel[] = [
     provider: "onnx-community",
     description: "Higher quality Qwen option with larger runtime footprint",
     estimatedSizeBytes: Math.round(1035 * 1024 * 1024),
+    preferredDtype: "q4f16",
+    fallbackDtypes: ["q4", "q8"],
   },
   {
     id: "onnx-community/Qwen3.5-2B-ONNX",
@@ -51,6 +61,8 @@ export const chatModels: ChatModel[] = [
     provider: "onnx-community",
     description: "Higher-quality local Qwen model in INT4 format",
     estimatedSizeBytes: Math.round(1900 * 1024 * 1024),
+    preferredDtype: "q4",
+    fallbackDtypes: ["q4f16", "q8"],
   },
 ];
 
@@ -96,6 +108,18 @@ export async function getAllGatewayModels(): Promise<
 
 export function getActiveModels(): ChatModel[] {
   return chatModels;
+}
+
+export function getLocalModelDtypeCandidates(
+  modelId: string
+): LocalModelDtype[] {
+  const model = chatModels.find((entry) => entry.id === modelId);
+  const candidates = [
+    model?.preferredDtype ?? "q4",
+    ...(model?.fallbackDtypes ?? ["q8", "fp16", "fp32"]),
+  ];
+
+  return Array.from(new Set(candidates));
 }
 
 export const allowedModelIds = new Set(chatModels.map((m) => m.id));

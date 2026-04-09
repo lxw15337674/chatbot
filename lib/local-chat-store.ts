@@ -40,6 +40,16 @@ export type LocalModelCacheMeta = {
   loadedAt: Date;
 };
 
+export type LocalModelAssetStatus = "missing" | "partial" | "complete";
+
+export type LocalModelAssetState = {
+  modelId: string;
+  status: LocalModelAssetStatus;
+  bytesTotal: number;
+  fileCount: number;
+  updatedAt: Date;
+};
+
 type StoredModelCacheMeta = {
   modelId: string;
   dtype: string;
@@ -48,6 +58,14 @@ type StoredModelCacheMeta = {
   fileCount: number;
   fromCacheCount: number;
   loadedAt: number;
+};
+
+type StoredModelAssetState = {
+  modelId: string;
+  status: LocalModelAssetStatus;
+  bytesTotal: number;
+  fileCount: number;
+  updatedAt: number;
 };
 
 export type LocalModelDownloadStatus = "downloading" | "done" | "failed";
@@ -99,11 +117,12 @@ type StoredMemoryRecord = {
 };
 
 const DB_NAME = "chatbot-local";
-const DB_VERSION = 4;
+const DB_VERSION = 5;
 const CHATS_STORE = "chats";
 const MESSAGES_STORE = "messages";
 const SETTINGS_STORE = "settings";
 const MODEL_META_STORE = "model_cache_meta";
+const MODEL_ASSET_STORE = "model_asset_state";
 const MODEL_DOWNLOAD_STORE = "model_download_state";
 const MEMORY_STORE = "long_term_memory";
 const EVENT_NAME = "local-chat-updated";
@@ -177,6 +196,13 @@ function openDatabase(): Promise<IDBDatabase> {
           keyPath: "modelId",
         });
         modelMeta.createIndex("loadedAt", "loadedAt", { unique: false });
+      }
+
+      if (!db.objectStoreNames.contains(MODEL_ASSET_STORE)) {
+        const modelAssets = db.createObjectStore(MODEL_ASSET_STORE, {
+          keyPath: "modelId",
+        });
+        modelAssets.createIndex("updatedAt", "updatedAt", { unique: false });
       }
 
       if (!db.objectStoreNames.contains(MODEL_DOWNLOAD_STORE)) {
@@ -502,6 +528,15 @@ function toLocalModelCacheMeta(
   };
 }
 
+function toLocalModelAssetState(
+  row: StoredModelAssetState
+): LocalModelAssetState {
+  return {
+    ...row,
+    updatedAt: new Date(row.updatedAt),
+  };
+}
+
 export async function saveLocalModelCacheMeta(
   payload: Omit<LocalModelCacheMeta, "loadedAt"> & { loadedAt?: number }
 ): Promise<void> {
@@ -530,6 +565,68 @@ export async function getLocalModelCacheMeta(
   await txDone(tx);
 
   return row ? toLocalModelCacheMeta(row) : null;
+}
+
+export async function saveLocalModelAssetState(params: {
+  modelId: string;
+  status: LocalModelAssetStatus;
+  bytesTotal?: number;
+  fileCount?: number;
+  updatedAt?: number;
+}): Promise<void> {
+  const db = await openDatabase();
+  const tx = db.transaction(MODEL_ASSET_STORE, "readwrite");
+  const store = tx.objectStore(MODEL_ASSET_STORE);
+  const existing = (await requestToPromise(
+    store.get(params.modelId)
+  )) as StoredModelAssetState | undefined;
+
+  const row: StoredModelAssetState = {
+    modelId: params.modelId,
+    status: params.status,
+    bytesTotal:
+      typeof params.bytesTotal === "number"
+        ? Math.max(0, params.bytesTotal)
+        : existing?.bytesTotal ?? 0,
+    fileCount:
+      typeof params.fileCount === "number"
+        ? Math.max(0, params.fileCount)
+        : existing?.fileCount ?? 0,
+    updatedAt: params.updatedAt ?? Date.now(),
+  };
+
+  store.put(row);
+  await txDone(tx);
+}
+
+export async function getLocalModelAssetState(
+  modelId: string
+): Promise<LocalModelAssetState | null> {
+  const db = await openDatabase();
+  const tx = db.transaction(MODEL_ASSET_STORE, "readonly");
+  const store = tx.objectStore(MODEL_ASSET_STORE);
+  const row = (await requestToPromise(
+    store.get(modelId)
+  )) as StoredModelAssetState | undefined;
+  await txDone(tx);
+
+  return row ? toLocalModelAssetState(row) : null;
+}
+
+export async function listLocalModelAssetStates(): Promise<
+  LocalModelAssetState[]
+> {
+  const db = await openDatabase();
+  const tx = db.transaction(MODEL_ASSET_STORE, "readonly");
+  const store = tx.objectStore(MODEL_ASSET_STORE);
+  const rows = (await requestToPromise(
+    store.getAll()
+  )) as StoredModelAssetState[];
+  await txDone(tx);
+
+  return rows.map(toLocalModelAssetState).sort(
+    (a, b) => b.updatedAt.getTime() - a.updatedAt.getTime()
+  );
 }
 
 function toLocalModelDownloadRecord(

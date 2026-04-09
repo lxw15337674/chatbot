@@ -20,7 +20,9 @@ import type { VisibilityType } from "@/components/chat/visibility-selector";
 import { allowedModelIds, DEFAULT_CHAT_MODEL } from "@/lib/ai/models";
 import type { Vote } from "@/lib/db/schema";
 import {
+  ensureLocalModelAssets,
   generateLocalAssistantResponse,
+  getVerifiedLocalModelAssetState,
   hasLoadedLocalModel,
   prepareLocalModel,
   type LocalModelLoadPhase,
@@ -82,6 +84,16 @@ type ActiveChatContextValue = {
 };
 
 const ActiveChatContext = createContext<ActiveChatContextValue | null>(null);
+const CHAT_DEBUG_PREFIX = "[active-chat]";
+
+function logChatDebug(message: string, details?: Record<string, unknown>) {
+  if (details) {
+    console.info(CHAT_DEBUG_PREFIX, message, details);
+    return;
+  }
+
+  console.info(CHAT_DEBUG_PREFIX, message);
+}
 
 function getMessageTimestamp(message: ChatMessage): number {
   const createdAt = message.metadata?.createdAt;
@@ -335,6 +347,7 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
   const messagesRef = useRef<ChatMessage[]>(messages);
   const abortControllerRef = useRef<AbortController | null>(null);
   const modelLoadProgressRef = useRef<ModelLoadProgressState | null>(null);
+  const statusRef = useRef<UseChatHelpers<ChatMessage>["status"]>(status);
   const loadSessionSequenceRef = useRef(0);
   const activeLoadSessionRef = useRef<string | null>(null);
   const cancelledLoadSessionsRef = useRef(new Set<string>());
@@ -357,6 +370,10 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     modelLoadProgressRef.current = modelLoadProgress;
   }, [modelLoadProgress]);
+
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
 
   const [input, setInput] = useState("");
   const [showCreditCardAlert, setShowCreditCardAlert] = useState(false);
@@ -413,7 +430,12 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
     void saveLocalSetting("local-reasoning-mode", reasoningMode);
   }, [reasoningMode]);
 
-  const persistConversation = async (nextMessages: ChatMessage[]) => {
+  const persistConversation = async (
+    nextMessages: ChatMessage[],
+    options?: {
+      modelId?: string;
+    }
+  ) => {
     if (nextMessages.length === 0) {
       return;
     }
@@ -422,7 +444,7 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
       chatId,
       title: extractFirstUserText(nextMessages),
       visibility: visibilityType,
-      modelId: currentModelIdRef.current,
+      modelId: resolveModelId(options?.modelId ?? currentModelIdRef.current),
     });
 
     await replaceLocalMessages(
@@ -611,7 +633,7 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
         ...previous,
         phase: "cancelled",
         progress: null,
-        message: "已取消当前加载并切换模型",
+        message: "已取消当前模型下载",
         updatedAt: Date.now(),
         canCancel: false,
       };
@@ -663,59 +685,111 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
         return;
       }
 
-      cancelModelLoad();
       setCurrentModelId(modelId);
     },
-    [cancelModelLoad]
+    []
   );
 
   const runAssistantGeneration = async (baseMessages: ChatMessage[]) => {
-    const modelId = currentModelIdRef.current;
+    const requestModelId = currentModelIdRef.current;
+    const requestReasoningMode = reasoningModeRef.current;
     const controller = new AbortController();
     abortControllerRef.current = controller;
     setStatus("submitted");
+    logChatDebug("runAssistantGeneration:start", {
+      chatId,
+      modelId: requestModelId,
+      reasoningMode: requestReasoningMode,
+      baseMessageCount: baseMessages.length,
+    });
 
     let loadSessionId: string | null = null;
-    const hasModelLoaded = hasLoadedLocalModel(modelId);
+    const hasRuntimeLoaded = hasLoadedLocalModel(requestModelId);
+    const assetState = await getVerifiedLocalModelAssetState(requestModelId).catch(
+      () => null
+    );
+    const hasCompleteAssets = assetState?.status === "complete";
+    logChatDebug("runAssistantGeneration:model-state", {
+      modelId: requestModelId,
+      hasRuntimeLoaded,
+      assetState: assetState?.status ?? "missing",
+      assetBytes: assetState?.bytesTotal ?? 0,
+      assetDtype: assetState?.dtype ?? null,
+    });
 
-    if (!hasModelLoaded) {
+    if (!hasCompleteAssets) {
       const currentLoad = modelLoadProgressRef.current;
       if (
         currentLoad &&
-        currentLoad.modelId === modelId &&
+        currentLoad.modelId === requestModelId &&
         (currentLoad.phase === "downloading" ||
           currentLoad.phase === "initializing")
       ) {
         loadSessionId = currentLoad.sessionId;
+        logChatDebug("runAssistantGeneration:reuse-download-session", {
+          modelId: requestModelId,
+          sessionId: loadSessionId,
+          phase: currentLoad.phase,
+        });
       } else {
-        loadSessionId = startModelLoadSession(modelId);
+        loadSessionId = startModelLoadSession(requestModelId);
+        logChatDebug("runAssistantGeneration:start-download-session", {
+          modelId: requestModelId,
+          sessionId: loadSessionId,
+        });
       }
     }
 
     try {
+      if (!hasCompleteAssets) {
+        logChatDebug("runAssistantGeneration:ensureLocalModelAssets", {
+          modelId: requestModelId,
+          loadSessionId,
+        });
+        await ensureLocalModelAssets({
+          modelId: requestModelId,
+          onLoadProgress: loadSessionId
+            ? (event) => applyModelLoadProgress(loadSessionId as string, event)
+            : undefined,
+          isLoadCancelled: loadSessionId
+            ? () => !isLoadSessionActive(loadSessionId as string)
+            : undefined,
+        });
+
+        if (loadSessionId) {
+          markModelLoadComplete(loadSessionId);
+          loadSessionId = null;
+        }
+      }
+
       const memorySystemMessage = await buildMemorySystemMessage(chatId);
       const inferenceMessages = memorySystemMessage
         ? [memorySystemMessage, ...baseMessages]
         : baseMessages;
-
-      const result = await generateLocalAssistantResponse({
-        modelId,
-        messages: inferenceMessages,
-        reasoningMode: reasoningModeRef.current,
-        signal: controller.signal,
-        onLoadProgress: loadSessionId
-          ? (event) => applyModelLoadProgress(loadSessionId as string, event)
-          : undefined,
-        isLoadCancelled: loadSessionId
-          ? () => !isLoadSessionActive(loadSessionId as string)
-          : undefined,
+      logChatDebug("runAssistantGeneration:generateLocalAssistantResponse", {
+        modelId: requestModelId,
+        inferenceMessageCount: inferenceMessages.length,
+        hasMemoryMessage: Boolean(memorySystemMessage),
+        hasRuntimeLoaded,
       });
 
-      if (loadSessionId) {
-        markModelLoadComplete(loadSessionId);
-      }
-
+      const result = await generateLocalAssistantResponse({
+        modelId: requestModelId,
+        messages: inferenceMessages,
+        reasoningMode: requestReasoningMode,
+        signal: controller.signal,
+      });
+      logChatDebug("runAssistantGeneration:generateLocalAssistantResponse:done", {
+        modelId: requestModelId,
+        textLength: result.text.length,
+        reasoningLength: result.reasoningText.length,
+        device: result.device,
+        dtype: result.dtype,
+      });
       if (controller.signal.aborted) {
+        logChatDebug("runAssistantGeneration:aborted-after-generate", {
+          modelId: requestModelId,
+        });
         setStatus("ready");
         return;
       }
@@ -724,7 +798,7 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
       const createdAt = new Date().toISOString();
       const chunks = splitTextForStreaming(result.text);
       const reasoningPart =
-        reasoningModeRef.current === "thinking" &&
+        requestReasoningMode === "thinking" &&
         result.reasoningText.trim().length > 0
           ? ([
               {
@@ -751,9 +825,15 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
       let streamedText = "";
       for (const chunk of chunks) {
         if (controller.signal.aborted) {
+          logChatDebug("runAssistantGeneration:aborted-during-stream", {
+            modelId: requestModelId,
+            streamedLength: streamedText.length,
+          });
           setStatus("ready");
           setMessages(baseMessages);
-          await persistConversation(baseMessages);
+          await persistConversation(baseMessages, {
+            modelId: requestModelId,
+          });
           return;
         }
 
@@ -784,11 +864,21 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
 
       const nextMessages = [...baseMessages, assistantMessage];
       setMessages(nextMessages);
-      await persistConversation(nextMessages);
+      await persistConversation(nextMessages, {
+        modelId: requestModelId,
+      });
+      logChatDebug("runAssistantGeneration:completed", {
+        modelId: requestModelId,
+        finalTextLength: result.text.length,
+        messageCount: nextMessages.length,
+      });
       setStatus("ready");
       setShowCreditCardAlert(false);
     } catch (error) {
       if (controller.signal.aborted) {
+        logChatDebug("runAssistantGeneration:aborted-in-catch", {
+          modelId: requestModelId,
+        });
         setStatus("ready");
         return;
       }
@@ -801,6 +891,10 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
       }
 
       setStatus("error");
+      logChatDebug("runAssistantGeneration:error", {
+        modelId: requestModelId,
+        message: error instanceof Error ? error.message : String(error),
+      });
       toast({
         type: "error",
         description:
@@ -809,6 +903,10 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
             : "Local model generation failed",
       });
     } finally {
+      logChatDebug("runAssistantGeneration:finally", {
+        modelId: requestModelId,
+        aborted: controller.signal.aborted,
+      });
       if (abortControllerRef.current === controller) {
         abortControllerRef.current = null;
       }
@@ -880,6 +978,9 @@ export function ActiveChatProvider({ children }: { children: ReactNode }) {
   const stop: UseChatHelpers<ChatMessage>["stop"] = async () => {
     abortControllerRef.current?.abort();
     abortControllerRef.current = null;
+    if (statusRef.current === "submitted") {
+      cancelModelLoad();
+    }
     setStatus("ready");
   };
 

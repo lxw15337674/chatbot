@@ -48,9 +48,8 @@ import {
 import {
   clearLocalChats,
   deleteLocalChat,
-  getLocalModelDownloadSummary,
-  listLocalModelCacheMeta,
 } from "@/lib/local-chat-store";
+import { getVerifiedLocalModelAssetState } from "@/lib/local-inference";
 import type { Attachment, ChatMessage } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import {
@@ -101,14 +100,12 @@ type LocalModelAvailabilityState = {
 type ModelAvailabilityStatus =
   | "available"
   | "need-download"
-  | "downloading"
-  | "unavailable";
+  | "downloading";
 
 const availabilityLabelByStatus: Record<ModelAvailabilityStatus, string> = {
-  available: "可用",
+  available: "已下载",
   "need-download": "需下载",
   downloading: "下载中",
-  unavailable: "不可用",
 };
 
 const availabilityVariantByStatus: Record<
@@ -118,7 +115,6 @@ const availabilityVariantByStatus: Record<
   available: "secondary",
   "need-download": "outline",
   downloading: "default",
-  unavailable: "destructive",
 };
 
 function getInlineModelStatus(params: {
@@ -145,14 +141,14 @@ function getInlineModelStatus(params: {
 
     if (modelLoadProgress.phase === "initializing") {
       return {
-        label: `${selectedModel.name}：模型准备中`,
+        label: `${selectedModel.name}：模型已下载`,
         toneClassName: "text-muted-foreground",
       };
     }
 
     if (modelLoadProgress.phase === "failed") {
       return {
-        label: `${selectedModel.name}：模型加载失败`,
+        label: `${selectedModel.name}：模型暂不可用`,
         toneClassName: "text-destructive",
       };
     }
@@ -181,22 +177,16 @@ function resolveModelAvailabilityStatus(params: {
 
   if (
     isCurrentLoadModel &&
-    (modelLoadProgress.phase === "downloading" ||
-      modelLoadProgress.phase === "initializing")
+    modelLoadProgress.phase === "downloading"
   ) {
-    if (availability?.downloadComplete) {
-      return "available";
-    }
-
     return "downloading";
   }
 
   if (
     isCurrentLoadModel &&
-    (modelLoadProgress.phase === "failed" ||
-      modelLoadProgress.phase === "cancelled")
+    modelLoadProgress.phase === "initializing"
   ) {
-    return "unavailable";
+    return "available";
   }
 
   if (availability?.downloadComplete) {
@@ -284,9 +274,8 @@ function PureMultimodalInput({
   useEffect(() => {
     let mounted = true;
 
-    const loadSelectedModelAvailability = async () => {
-      const rows = await listLocalModelCacheMeta();
-      const row = rows.find((entry) => entry.modelId === selectedModelId);
+    const loadPromise = (async () => {
+      const row = await getVerifiedLocalModelAssetState(selectedModelId);
 
       if (!mounted) {
         return;
@@ -297,23 +286,11 @@ function PureMultimodalInput({
         return;
       }
 
-      const summary = await getLocalModelDownloadSummary(
-        `${row.modelId}:${row.dtype}`
-      );
-
-      if (!mounted) {
-        return;
-      }
-
       setSelectedModelAvailability({
         bytesTotal: row.bytesTotal,
-        downloadComplete:
-          summary.totalFiles > 0 &&
-          summary.completedFiles === summary.totalFiles,
+        downloadComplete: row.status === "complete",
       });
-    };
-
-    const loadPromise = loadSelectedModelAvailability();
+    })();
     loadPromise.catch(() => {
       if (mounted) {
         setSelectedModelAvailability(null);
@@ -323,7 +300,12 @@ function PureMultimodalInput({
     return () => {
       mounted = false;
     };
-  }, [selectedModelId]);
+  }, [
+    selectedModelId,
+    modelLoadProgress?.modelId,
+    modelLoadProgress?.phase,
+    modelLoadProgress?.sessionId,
+  ]);
 
   useEffect(() => {
     setLocalStorageInput(input);
@@ -879,48 +861,35 @@ function PureModelSelectorCompact({
 
     let mounted = true;
 
-    const loadCacheMeta = async () => {
-      const rows = await listLocalModelCacheMeta();
-      const latestMetaByModelId = new Map<string, (typeof rows)[number]>();
-
-      for (const row of rows) {
-        if (!latestMetaByModelId.has(row.modelId)) {
-          latestMetaByModelId.set(row.modelId, row);
-        }
-      }
-
-      const availabilityEntries = await Promise.all(
-        Array.from(latestMetaByModelId.values()).map(async (row) => {
-          const summary = await getLocalModelDownloadSummary(
-            `${row.modelId}:${row.dtype}`
-          );
-
-          return [
-            row.modelId,
-            {
-              bytesTotal: row.bytesTotal,
-              downloadComplete:
-                summary.totalFiles > 0 &&
-                summary.completedFiles === summary.totalFiles,
-            },
-          ] as const;
-        })
+    const loadCacheMetaPromise = (async () => {
+      const rows = await Promise.all(
+        chatModels.map((model) => getVerifiedLocalModelAssetState(model.id))
       );
+      const availabilityEntries = rows.map((row) => [
+        row.modelId,
+        {
+          bytesTotal: row.bytesTotal,
+          downloadComplete: row.status === "complete",
+        },
+      ] as const);
 
       if (!mounted) {
         return;
       }
 
       setAvailabilityByModelId(Object.fromEntries(availabilityEntries));
-    };
-
-    const loadCacheMetaPromise = loadCacheMeta();
+    })();
     loadCacheMetaPromise.catch(() => undefined);
 
     return () => {
       mounted = false;
     };
-  }, [open]);
+  }, [
+    open,
+    modelLoadProgress?.modelId,
+    modelLoadProgress?.phase,
+    modelLoadProgress?.sessionId,
+  ]);
 
   const selectedModel =
     activeModels.find((m: ChatModel) => m.id === selectedModelId) ??
@@ -1009,8 +978,7 @@ function PureModelSelectorCompact({
                   const logoProvider = model.id.split("/")[0];
                   const isModelDownloading =
                     modelLoadProgress?.modelId === model.id &&
-                    (modelLoadProgress.phase === "downloading" ||
-                      modelLoadProgress.phase === "initializing");
+                    modelLoadProgress.phase === "downloading";
 
                   const runtimeSizeLabel = isModelDownloading
                     ? modelLoadProgress.totalBytes > 0

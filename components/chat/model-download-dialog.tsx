@@ -128,7 +128,7 @@ export function ModelDownloadDialog({
       <DialogContent className="max-w-md" showCloseButton={false}>
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
-            模型下载中
+            下载模型
             <Badge variant={phaseVariantMap[modelLoadProgress.phase]}>
               {phaseLabelMap[modelLoadProgress.phase]}
             </Badge>
